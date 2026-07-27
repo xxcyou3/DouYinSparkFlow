@@ -218,6 +218,8 @@ def scroll_and_select_user(page, username, targets):
 
 
 def do_user_task(browser, username, cookies, targets):
+        page = None
+        context = None
         try:
             context = browser.new_context()  # 每个任务使用独立的上下文
             context.set_default_navigation_timeout(config["browserTimeout"])  # 设置导航超时时间为 120 秒
@@ -228,7 +230,16 @@ def do_user_task(browser, username, cookies, targets):
             if matchMode == "short_id":  # 使用抖音号进行匹配
                 page.on("response", handle_response)
             
-            # 打开抖音创作者中心
+            # ==== Cookie 注入流程（关键！）====
+            # 问题分析：page.goto(url) 后调用 context.add_cookies，
+            # Cookie 虽然已被设置，但刚刚渲染的 DOM 基于未登录状态生成，
+            # 必须 reload 一次才能让 Cookie 在这次请求中携带，从而渲染出已登录的聊天页。
+            # 原代码顺序：goto(creator.douyin.com) -> add_cookies -> goto(chat) 不刷新
+            # 修复流程:
+            #   1) 先 goto 创作者中心（建立域名上下文）
+            #   2) add_cookies
+            #   3) 导航到聊天页
+            #   4) reload() 强制带上新 Cookie 重新请求一次，确保服务端返回的是已登录内容
             retry_operation(
                 "打开抖音创作者中心",
                 page.goto,
@@ -238,6 +249,7 @@ def do_user_task(browser, username, cookies, targets):
             )
             # 注入 Cookie
             context.add_cookies(cookies)
+            logger.debug(f"账号 {username} 已注入 {len(cookies)} 个 Cookie")
 
             # 导航到消息页面
             retry_operation(
@@ -247,6 +259,45 @@ def do_user_task(browser, username, cookies, targets):
                 delay=5,
                 url="https://creator.douyin.com/creator-micro/data/following/chat",
             )
+            # ★ 关键修复：重新加载一次，确保 Cookie 实际生效
+            logger.debug(f"账号 {username} Reload 页面以携带 Cookie")
+            page.reload(wait_until="domcontentloaded")
+            # 等待网络稳定
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+
+            # 登录校验：检测 URL / 页面中是否出现登录相关关键字
+            cur_url = page.url
+            logger.debug(f"账号 {username} 当前页面 URL: {cur_url}")
+            if any(k in cur_url.lower() for k in ["login", "passport", "signin", "sso"]):
+                logger.error(f"账号 {username} 页面跳转到了登录页 URL={cur_url}，Cookie 未生效或已过期，请重新获取 Cookie")
+                try:
+                    page.screenshot(path=f"logs/{username}_login_redirect.png", full_page=True)
+                except Exception:
+                    pass
+                raise RuntimeError(f"Cookie 无效，跳转到登录页: {cur_url}")
+
+            # 二次校验：搜索页面内关键字（未登录态会有「登录」「扫码登录」等）
+            try:
+                body_text = page.evaluate("() => document.body ? document.body.innerText.slice(0, 5000) : ''")
+            except Exception:
+                body_text = ""
+            login_keywords = ["扫码登录", "请先登录", "立即登录", "未登录", "登录创作者平台", "手机号登录", "密码登录", "验证后可继续"]
+            hit_keywords = [kw for kw in login_keywords if kw in body_text]
+            if hit_keywords:
+                logger.error(
+                    f"账号 {username} 页面检测到登录相关关键字 {hit_keywords}，Cookie 未生效。"
+                    f" 当前 body 前 300 字：{body_text[:300]}"
+                )
+                try:
+                    page.screenshot(path=f"logs/{username}_need_login.png", full_page=True)
+                except Exception:
+                    pass
+                raise RuntimeError(f"Cookie 未生效，页面仍处于登录态检测：{hit_keywords}")
+
+            logger.debug(f"账号 {username} 登录校验通过，开始发送消息流程")
 
             logger.debug(f"账号 {username} 开始发送消息")
             # 滚动并选择用户
@@ -285,8 +336,23 @@ def do_user_task(browser, username, cookies, targets):
                     logger.warning(
                         f"账号 {username} 当前已收集 userIDDict 条目数: {len(userIDDict)}，内容: {json.dumps(userIDDict, ensure_ascii=False)[:800]}"
                     )
+                try:
+                    page.screenshot(path=f"logs/{username}_no_match.png", full_page=True)
+                except Exception:
+                    pass
 
         except Exception as e:
+            try:
+                if page is not None:
+                    page.screenshot(path=f"logs/{username}_ERROR.png", full_page=True)
+                    logger.error(f"账号 {username} 已保存异常截图 logs/{username}_ERROR.png")
+                    with open(f"logs/{username}_ERROR_page.html", "w", encoding="utf-8") as f:
+                        try:
+                            f.write(page.content())
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             logger.error(
                 f"账号 {username} 执行任务时发生异常: {type(e).__name__}: {e}\n"
                 + traceback.format_exc()
@@ -294,7 +360,8 @@ def do_user_task(browser, username, cookies, targets):
             raise
         finally:
             try:
-                context.close()  # 任务完成后关闭上下文
+                if context is not None:
+                    context.close()  # 任务完成后关闭上下文
             except Exception:
                 pass
 
