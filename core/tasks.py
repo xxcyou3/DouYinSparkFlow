@@ -223,50 +223,52 @@ def _close_login_save_popup(page, username):
 
 
 def _probe_im_apis(page, username):
-    """主动调用聊天/搜索/关注相关接口，避免跨域，base 用当前 location.origin。"""
+    """所有接口强制走 https://www.douyin.com (IM/搜索/关注 API 仅在 www 域名可命中)."""
     global userIDDict
     snap = {}
     try:
         snap = page.evaluate("""async () => {
             const res = {};
-            const origin = (location && location.origin) ? location.origin : 'https://www.douyin.com';
-            const common = 'version_code=1700&device_platform=webapp&aid=6383&webcast_sdk_version=1700';
+            const www = 'https://www.douyin.com';
+            const common = 'version_code=1700&device_platform=webapp&aid=6383&webcast_sdk_version=1700&X-Bogus=0';
             const urls = [
-                origin + '/aweme/v1/web/im/user/info/?cursor=0&user_source=0&count=100&' + common,
-                origin + '/aweme/v1/web/im/conversation/list/?cursor=0&count=50&' + common,
-                origin + '/aweme/v1/web/im/user/list/?cursor=0&count=100&' + common,
-                'https://creator.douyin.com/aweme/v1/creator/im/user_detail/?user_source=0&count=100&cursor=0&' + common,
-                origin + '/aweme/v1/user/following/list/?user_id=&max_time=0&count=50&' + common,
-                origin + '/aweme/v1/web/following/list/?user_id=&max_time=0&count=50&' + common,
-                origin + '/aweme/v1/user/follower/list/?user_id=&max_time=0&count=50&' + common,
-                origin + '/aweme/v1/web/search/sug/?keyword=搜索&from_group_id=&source=general&type=1&' + common,
-                origin + '/passport/web/user/info/?aid=6383&device_platform=webapp',
+                www + '/aweme/v1/web/im/user/info/?cursor=0&user_source=0&count=100&' + common,
+                www + '/aweme/v1/web/im/conversation/list/?cursor=0&count=50&' + common,
+                www + '/aweme/v1/web/im/user/list/?cursor=0&count=100&' + common,
+                www + '/aweme/v1/web/user/following/list/?user_id=&max_time=0&count=100&' + common,
+                www + '/aweme/v1/web/user/follower/list/?user_id=&max_time=0&count=100&' + common,
+                www + '/aweme/v1/user/following/list/?user_id=&max_time=0&count=100&' + common,
+                www + '/aweme/v1/user/follower/list/?user_id=&max_time=0&count=100&' + common,
+                www + '/aweme/v1/web/search/sug/?keyword=抖音&from_group_id=&source=general&type=1&' + common,
+                www + '/aweme/v1/web/search/user/?keyword=抖音&search_channel=aweme_user_web&search_source=normal&count=10&' + common,
             ];
             for (let i = 0; i < urls.length; i++) {
                 try {
-                    const u = urls[i];
-                    const r = await fetch(u, {credentials:'include', mode:'cors'}).catch(err => ({err}));
+                    const r = await fetch(urls[i], {credentials:'include', mode:'cors'}).catch(err => ({err}));
                     if (r && r.err) { res['e'+i] = String(r.err).slice(0,200); continue; }
-                    const t = await r.text();
-                    res['u'+i] = (t || '').slice(0, 500);
                     res['s'+i] = r.status;
+                    try {
+                        const j = await r.json();
+                        res['u'+i] = JSON.stringify(j).slice(0,600);
+                    } catch(_) {
+                        const t = await r.text();
+                        res['u'+i] = (t||'').slice(0,400);
+                    }
                 } catch(e) {
                     res['e'+i] = String(e).slice(0,200);
                 }
-                await new Promise(r => setTimeout(r, 350));
+                await new Promise(r => setTimeout(r, 400));
             }
             return res;
         }""")
         parts = []
         for k in sorted(snap.keys()):
             v = snap[k]
-            sv = str(v)
-            if sv[:4] in ("<htm",):
-                continue
+            sv = str(v).replace("\n", " ")
             if k.startswith("u"):
-                sv = sv.replace("\n", " ")[:300]
+                sv = sv[:400]
             parts.append(f"{k}={sv!r}")
-        logger.debug(f"账号 {username} 主动探测 9 个接口结果：" + " ".join(parts))
+        logger.debug(f"账号 {username} 主动探测(固定www域名) 9 个接口结果：" + " ".join(parts))
     except Exception as e:
         logger.debug(f"探测接口异常: {e}")
     time.sleep(2.5)
@@ -776,6 +778,220 @@ def scroll_and_select_user(page, username, targets):
             logger.debug(f"userIDDict: {json.dumps(userIDDict, ensure_ascii=False)[:800]}")
 
 
+def _search_and_open_profile_pm(page, username, target_short_ids):
+    """终极兜底：www.douyin.com 搜索框搜抖音号 → 进用户主页 → 点「私信」进入聊天窗。
+
+    目标列表是 target_short_ids（通常就是 ['1351217349'] 这种抖音号 / unique_id / 昵称）。
+    每成功进入聊天窗就 yield 一个识别后的名字（用于日志/后续发送）。
+    """
+    for t in target_short_ids:
+        try:
+            t = norm(t)
+            if not t:
+                continue
+            logger.info(f"[终极兜底] 开始搜索抖音号/昵称 {t!r} → 个人页 → 私信")
+            # 1) 先回到首页，确保有搜索框
+            try:
+                cur = page.url or ""
+                if "douyin.com" not in cur or cur.startswith("https://creator"):
+                    page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=50000)
+                    try: page.wait_for_load_state("networkidle", timeout=12000)
+                    except Exception: pass
+                    time.sleep(2)
+            except Exception:
+                pass
+
+            # 2) 尝试多种 www 首页搜索框
+            search_locs = [
+                'input[placeholder*="搜索"]',
+                'input[placeholder*="search" i]',
+                'input[type="search"]',
+                '[class*="search"] input',
+                '[class*="header"] input[placeholder*="搜索"]',
+                '[class*="top-search"] input',
+                '[class*="Search"] input',
+            ]
+            search_input = None
+            for sl in search_locs:
+                try:
+                    if page.locator(sl).count() > 0:
+                        search_input = page.locator(sl).first
+                        logger.debug(f"[终极兜底] 找到搜索框 {sl}")
+                        break
+                except Exception:
+                    continue
+            if search_input is None:
+                # 直接跳搜索结果页
+                search_url = f"https://www.douyin.com/search/{urllib.parse.quote(t)}?type=user"
+                logger.info(f"[终极兜底] 未找到搜索框，直接跳 URL {search_url[:90]}")
+                try:
+                    page.goto(search_url, wait_until="domcontentloaded", timeout=50000)
+                except Exception as e:
+                    logger.warning(f"跳搜索结果页失败: {e}")
+                    continue
+            else:
+                try:
+                    if hasattr(search_input, "click"): search_input.click(timeout=2000)
+                    search_input.fill("")
+                    search_input.type(t, delay=40)
+                    time.sleep(1.2)
+                    search_input.press("Enter")
+                except Exception as e:
+                    logger.warning(f"搜索框输入 {t!r} 失败: {e}")
+                    search_url = f"https://www.douyin.com/search/{urllib.parse.quote(t)}?type=user"
+                    try:
+                        page.goto(search_url, wait_until="domcontentloaded", timeout=50000)
+                    except Exception:
+                        continue
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            time.sleep(2.5)
+
+            # 3) 切到「用户」tab（如果有）
+            try:
+                user_tabs = [
+                    "xpath=//div[contains(@class,'tab')]//*[text()='用户' or contains(normalize-space(.),'用户')]",
+                    "xpath=//a[contains(text(),'用户')]",
+                    "xpath=//div[contains(@class,'search-tabs')]//*[text()='用户']",
+                ]
+                for ut in user_tabs:
+                    try:
+                        if page.locator(ut).count() > 0:
+                            page.locator(ut).first.click(timeout=1500)
+                            time.sleep(1.5)
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # 4) 找用户卡片里第一个含 target 的结果，点进主页
+            user_card_selectors = [
+                "xpath=//a[contains(@href,'/user/')]",
+                "xpath=//li[contains(@class,'user')]//a[contains(@href,'/user/')]",
+                "xpath=//div[contains(@class,'user-card')]//a[contains(@href,'/user/')]",
+                "xpath=//div[contains(@class,'UserCard')]//a[contains(@href,'/user/')]",
+            ]
+            matched_href = None
+            found_nickname = None
+            try:
+                for ucs in user_card_selectors:
+                    n = page.locator(ucs).count()
+                    for i in range(min(6, n)):
+                        try:
+                            loc = page.locator(ucs).nth(i)
+                            href = ""
+                            try: href = loc.get_attribute("href", timeout=600) or ""
+                            except Exception: pass
+                            txt = ""
+                            try: txt = norm(loc.inner_text(timeout=800))
+                            except Exception: pass
+                            # 同一卡片附近再搜一下昵称/抖音号文本
+                            nick_txt = txt
+                            try:
+                                p = loc.locator("xpath=./..").first
+                                nick_txt = norm(p.inner_text(timeout=800))
+                            except Exception:
+                                pass
+                            if t and (t in nick_txt or t in txt or (t.isdigit() and t in href)):
+                                matched_href = href
+                                found_nickname = nick_txt.splitlines()[0] if nick_txt else t
+                                logger.info(f"[终极兜底] 命中用户卡片 {found_nickname!r} href={href[:80]}")
+                                break
+                        except Exception:
+                            continue
+                    if matched_href: break
+            except Exception:
+                pass
+            if not matched_href:
+                try:
+                    # 扫一遍 body 里所有 /user/ 链接
+                    links = page.evaluate("""() => {
+                        const arr = [];
+                        const all = document.querySelectorAll('a[href*="/user/"]');
+                        for (let i=0;i<all.length && i<12;i++) {
+                            const a = all[i];
+                            arr.push({href: a.getAttribute('href'), txt: (a.innerText||'').trim().slice(0,60)});
+                        }
+                        return arr;
+                    }""")
+                    for l in links:
+                        h = l.get("href") or ""
+                        tx = norm(l.get("txt",""))
+                        if t and (t in tx or (t.isdigit() and t in h)):
+                            matched_href = h
+                            found_nickname = (tx or t).splitlines()[0]
+                            logger.info(f"[终极兜底] 二次匹配命中 {found_nickname!r} href={h[:80]}")
+                            break
+                except Exception as e:
+                    logger.debug(f"兜底扫链接失败: {e}")
+            if not matched_href:
+                logger.warning(f"[终极兜底] 搜索 {t!r} 没找到用户卡片，跳过")
+                continue
+            # 拼接完整 URL
+            if matched_href.startswith("/"):
+                matched_href = "https://www.douyin.com" + matched_href
+            # 5) 点进个人主页
+            try:
+                page.goto(matched_href, wait_until="domcontentloaded", timeout=55000)
+                try: page.wait_for_load_state("networkidle", timeout=12000)
+                except Exception: pass
+                time.sleep(2)
+            except Exception as e:
+                logger.warning(f"[终极兜底] 跳主页 {matched_href[:80]} 失败: {e}")
+                continue
+            # 6) 点「私信」按钮（各种文案/图标）
+            pm_btns = [
+                "xpath=//button[contains(normalize-space(.),'私信')]",
+                "xpath=//div[contains(@role,'button')][contains(normalize-space(.),'私信')]",
+                "xpath=//a[contains(normalize-space(.),'私信')]",
+                "xpath=//button/*[self::span or self::div][contains(.,'私信')]/ancestor::button[1]",
+                '[class*="private-message"] [role="button"]',
+                '[class*="PrivateMessage"] [onclick]',
+                '[class*="pmBtn"]',
+            ]
+            pm_clicked = False
+            for pb in pm_btns:
+                try:
+                    n = page.locator(pb).count()
+                    for i in range(min(3, n)):
+                        try:
+                            loc = page.locator(pb).nth(i)
+                            try: vis = loc.is_visible(timeout=500)
+                            except Exception: vis = True
+                            if not vis: continue
+                            loc.click(timeout=2500)
+                            pm_clicked = True
+                            time.sleep(2.5)
+                            break
+                        except Exception:
+                            continue
+                    if pm_clicked: break
+                except Exception:
+                    continue
+            if not pm_clicked:
+                logger.warning(f"[终极兜底] 主页未找到「私信」按钮，跳过 {t!r}")
+                continue
+            # 7) 等待聊天输入框（弹层或页面）
+            try:
+                page.wait_for_selector(CHAT_EDITOR_SELECTOR, timeout=18000)
+            except Exception as e:
+                logger.warning(f"[终极兜底] 私信输入框 {CHAT_EDITOR_SELECTOR} 未出现，尝试降级: {e}")
+                for fs in ('[contenteditable="true"]', 'textarea', '[class*="chat-input"]', '[class*="editor"] textarea'):
+                    try:
+                        if page.locator(fs).count() > 0:
+                            logger.info(f"[终极兜底] 使用降级输入框 {fs}")
+                            break
+                    except Exception:
+                        continue
+            yield found_nickname or t
+        except Exception as e:
+            logger.warning(f"[终极兜底] {t!r} 搜索进私信流程异常: {e}\n{traceback.format_exc(limit=2)}")
+            continue
+
+
 def do_user_task(browser, username, cookies, targets):
     page = None
     context = None
@@ -969,27 +1185,47 @@ def do_user_task(browser, username, cookies, targets):
         good_kw = [k for k in ["推荐", "热榜", "关注", "搜索", "首页", "消息"] if k in body_home]
         logger.debug(f"账号 {username} 首页登录特征：bad={bad_kw} good={good_kw}")
         if bad_kw and not good_kw:
-            logger.warning(f"首页疑似未登录（{bad_kw}），仍尝试进入 creator 中心 IM")
+            logger.warning(f"首页疑似未登录（{bad_kw}），继续尝试")
 
-        retry_operation(
-            "导航到抖音 creator 中心消息页面（直接 message 专门页）",
-            page.goto,
-            retries=config["taskRetryTimes"],
-            delay=5,
-            url="https://creator.douyin.com/creator-micro/message",
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
+        # 不再跳 creator 中心/message（2026年改版后 creator/message 只是通知中心，没有会话列表）
+        # 留在 www.douyin.com（所有 IM API 都在这个域，且有首页搜索框）
+        # 先尝试在首页点「消息」展开私信弹层（如果有）
         try:
-            page.reload(wait_until="domcontentloaded", timeout=45000)
+            msg_btns = [
+                "xpath=//a[contains(normalize-space(.),'消息') and not(contains(@href,'login'))]",
+                "xpath=//div[contains(@class,'message')][contains(@role,'button')]",
+                "xpath=//*[contains(@class,'topNav')]//*[contains(normalize-space(.),'消息')]",
+                "xpath=//header//*[self::span or self::a or self::button or self::div][normalize-space()='消息']",
+            ]
+            msg_clicked = False
+            for mb in msg_btns:
+                try:
+                    n = page.locator(mb).count()
+                    for i in range(min(3, n)):
+                        loc = page.locator(mb).nth(i)
+                        try: vis = loc.is_visible(timeout=500)
+                        except Exception: vis = True
+                        if not vis: continue
+                        try:
+                            txt = norm(loc.inner_text(timeout=600))
+                        except Exception:
+                            txt = ""
+                        if any(k in txt for k in ["首页", "推荐", "朋友"]):
+                            continue
+                        loc.click(timeout=1800)
+                        msg_clicked = True
+                        time.sleep(2)
+                        break
+                    if msg_clicked: break
+                except Exception:
+                    continue
+            if msg_clicked:
+                try: page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception: pass
+                wait_chat_page_ready(page, username, max_wait=25)
+                logger.info("首页「消息」弹层已点击")
         except Exception as e:
-            logger.warning(f"creator/message 页 reload 超时，忽略继续: {e}")
-        try:
-            page.wait_for_load_state("networkidle", timeout=20000)
-        except Exception:
-            pass
-        wait_chat_page_ready(page, username, max_wait=60)
-        _ensure_creator_message_view(page, username, max_wait=40)
+            logger.debug(f"点消息弹层异常: {e}")
 
         cur_url = page.url
         logger.debug(f"账号 {username} 当前页面 URL: {cur_url}")
@@ -1016,7 +1252,7 @@ def do_user_task(browser, username, cookies, targets):
         login_hints = [
             "聊天", "消息", "会话", "发送", "朋友", "粉丝", "私信",
             "conversation", "搜索", "聊天记录", "互动管理", "数据中心",
-            "全部消息", "好友",
+            "全部消息", "好友", "推荐", "关注", "热榜",
         ]
         hint_hit = [h for h in login_hints if h in body_text]
 
@@ -1045,7 +1281,7 @@ def do_user_task(browser, username, cookies, targets):
 
         if hit_keywords and not hint_hit:
             logger.error(
-                f"登录校验失败：命中 {hit_keywords}，未发现聊天特征。"
+                f"登录校验失败：命中 {hit_keywords}，未发现聊天/内容特征。"
                 f" body前600字：{body_text[:600]}"
             )
             try:
@@ -1057,22 +1293,27 @@ def do_user_task(browser, username, cookies, targets):
             raise RuntimeError(f"Cookie 未生效，页面仍显示登录提示：{hit_keywords}")
 
         logger.info(
-            f"账号 {username} 进入聊天页成功（特征命中={hint_hit}，URL={cur_url[:120]}），开始匹配好友"
+            f"账号 {username} 登录校验成功（good={good_kw} hints={hint_hit}，URL={cur_url[:120]}），开始匹配好友"
         )
         try:
             logger.debug(f"页面文本前1200字：{body_text[:1200]}")
         except Exception:
             pass
 
-        if len(userIDDict) == 0:
-            logger.info(f"userIDDict 为空，进入好友匹配前再强制探测 9 个接口")
-            _probe_im_apis(page, username)
+        # 先强制探测 2 轮，保证 userIDDict 在 www 域下有机会命中
+        for _ in range(2):
             _probe_im_apis(page, username)
 
         any_matched = False
+        already_sent = set()
+
+        # 优先：会话列表策略（如果消息弹层/聊天页能看到会话）
         for friend_name in scroll_and_select_user(page, username, targets):
+            if friend_name in already_sent:
+                continue
             any_matched = True
-            logger.info(f"账号 {username} 选中好友/会话 {friend_name!r}，准备发送消息")
+            already_sent.add(friend_name)
+            logger.info(f"账号 {username} 选中好友/会话 {friend_name!r}（会话策略），准备发送消息")
             try:
                 page.wait_for_selector(CHAT_EDITOR_SELECTOR, timeout=20000)
             except Exception as e:
@@ -1142,6 +1383,81 @@ def do_user_task(browser, username, cookies, targets):
                 chat_input.press("Enter")
             logger.info(f"账号 {username} -> {friend_name!r} 消息发送完成")
             time.sleep(2)
+
+        # 终极兜底：会话列表找不到 → 走「搜索抖音号→个人页→私信→发送」
+        if not any_matched or len(already_sent) < len(targets):
+            remaining_for_fallback = [t for t in targets if not any(
+                norm(t) == norm(a) or norm(t) in norm(a) or norm(a) in norm(t)
+                for a in already_sent)]
+            if remaining_for_fallback:
+                logger.warning(f"[终极兜底] 进入搜索→个人页→私信流程（targets={remaining_for_fallback}）")
+                for friend_name in _search_and_open_profile_pm(page, username, remaining_for_fallback):
+                    if friend_name in already_sent:
+                        continue
+                    any_matched = True
+                    already_sent.add(friend_name)
+                    logger.info(f"账号 {username} 选中好友/会话 {friend_name!r}（兜底策略），准备发送消息")
+                    try:
+                        page.wait_for_selector(CHAT_EDITOR_SELECTOR, timeout=20000)
+                    except Exception as e:
+                        logger.warning(f"兜底：聊天输入框 {CHAT_EDITOR_SELECTOR} 未出现，尝试降级: {e}")
+                        for fs in ('[class*="chat-input"]', '[contenteditable="true"]', 'div[class*="input"]', 'textarea'):
+                            try:
+                                if page.locator(fs).count() > 0:
+                                    logger.debug(f"兜底用输入框选择器: {fs}")
+                                    break
+                            except Exception:
+                                continue
+                    chat_input = page.locator(CHAT_EDITOR_SELECTOR).first
+                    if chat_input.count() == 0:
+                        for fs in ('[class*="chat-input"]', '[contenteditable="true"]', 'div[class*="input"]', 'textarea'):
+                            try:
+                                if page.locator(fs).count() > 0:
+                                    chat_input = page.locator(fs).first
+                                    break
+                            except Exception:
+                                pass
+                    message = build_message()
+                    lines = message.split("\\n")
+                    for i, line in enumerate(lines):
+                        try:
+                            chat_input.type(line, timeout=5000)
+                        except Exception as e:
+                            logger.warning(f"兜底输入行失败，尝试 click 聚焦后重输: {e}")
+                            try:
+                                chat_input.click(timeout=2000)
+                                time.sleep(0.3)
+                                chat_input.type(line, timeout=5000)
+                            except Exception as e2:
+                                logger.error(f"兜底仍无法输入，跳过该好友: {e2}")
+                                break
+                        if i != len(lines) - 1:
+                            chat_input.press("Shift+Enter")
+                            time.sleep(0.1)
+                    logger.info(f"账号 {username} -> {friend_name!r} 准备发送：\n\t{message}")
+                    try:
+                        send_btns = [
+                            'button[class*="send"]',
+                            'div[class*="send-button"]',
+                            'svg[class*="send"]',
+                            '[aria-label="发送"]',
+                        ]
+                        clicked_send = False
+                        for sb in send_btns:
+                            try:
+                                if page.locator(sb).count() > 0:
+                                    page.locator(sb).first.click(timeout=1500)
+                                    clicked_send = True
+                                    logger.debug(f"点击发送按钮 {sb}")
+                                    break
+                            except Exception:
+                                continue
+                        if not clicked_send:
+                            chat_input.press("Enter")
+                    except Exception:
+                        chat_input.press("Enter")
+                    logger.info(f"账号 {username} -> {friend_name!r} 消息发送完成")
+                    time.sleep(2)
 
         if not any_matched:
             logger.warning(
