@@ -149,7 +149,10 @@ def scroll_and_select_user(page, username, targets):
                         return
                     break
             except Exception as e:
-                traceback.print_exc()
+                logger.error(
+                    f"账号 {username} 处理好友元素时出错: {type(e).__name__}: {e}\n"
+                    + traceback.format_exc()
+                )
         else:
             # [修复] 检查本轮是否有新好友被发现
             new_found = len(found_targets) > prev_found_count
@@ -215,61 +218,85 @@ def scroll_and_select_user(page, username, targets):
 
 
 def do_user_task(browser, username, cookies, targets):
-        context = browser.new_context()  # 每个任务使用独立的上下文
-        context.set_default_navigation_timeout(config["browserTimeout"])  # 设置导航超时时间为 120 秒
-        context.set_default_timeout(config["browserTimeout"])  # 设置所有操作的默认超时时间为 120 秒
+        try:
+            context = browser.new_context()  # 每个任务使用独立的上下文
+            context.set_default_navigation_timeout(config["browserTimeout"])  # 设置导航超时时间为 120 秒
+            context.set_default_timeout(config["browserTimeout"])  # 设置所有操作的默认超时时间为 120 秒
 
-        page = context.new_page()
-        
-        if matchMode == "short_id":  # 使用抖音号进行匹配
-            page.on("response", handle_response)
-        
-        # 打开抖音创作者中心
-        retry_operation(
-            "打开抖音创作者中心",
-            page.goto,
-            retries=config["taskRetryTimes"],
-            delay=5,
-            url="https://creator.douyin.com/",
-        )
-        # 注入 Cookie
-        context.add_cookies(cookies)
-
-        # 导航到消息页面
-        retry_operation(
-            "导航到消息页面",
-            page.goto,
-            retries=config["taskRetryTimes"],
-            delay=5,
-            url="https://creator.douyin.com/creator-micro/data/following/chat",
-        )
-
-        logger.debug(f"账号 {username} 开始发送消息")
-        # 滚动并选择用户
-        for username in scroll_and_select_user(page, username, targets):
-            logger.debug(f"账号 {username} 已选中好友 {username} 发送消息")
-            # 等待聊天输入框元素加载完成，使用更稳定的属性选择器
-            chat_input_selector = "xpath=//div[contains(@class, 'chat-input-')]"
-            page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
-            chat_input = page.locator(chat_input_selector)
-
-            # 在 chat-input-dccKiL 中输入内容
-            message = build_message()
-            for line in message.split("\\n"):
-                chat_input.type(line)  # 输入每一行
-                # 如果不是最后一行，模拟 Shift+Enter 插入换行
-                if line != message.split("\\n")[-1]:
-                    chat_input.press("Shift+Enter")  # 模拟 Shift+Enter 插入换行
-
-            logger.debug(
-                f"账号 {username} 准备发送消息给好友 {username}：\n\t{message}"
+            page = context.new_page()
+            
+            if matchMode == "short_id":  # 使用抖音号进行匹配
+                page.on("response", handle_response)
+            
+            # 打开抖音创作者中心
+            retry_operation(
+                "打开抖音创作者中心",
+                page.goto,
+                retries=config["taskRetryTimes"],
+                delay=5,
+                url="https://creator.douyin.com/",
             )
-            logger.debug(f"账号 {username} 给好友 {username} 发送消息完成")
-            # 模拟按下回车键发送消息
-            chat_input.press("Enter")
-            time.sleep(2)  # 发送完等待一会儿
+            # 注入 Cookie
+            context.add_cookies(cookies)
 
-        context.close()  # 任务完成后关闭上下文
+            # 导航到消息页面
+            retry_operation(
+                "导航到消息页面",
+                page.goto,
+                retries=config["taskRetryTimes"],
+                delay=5,
+                url="https://creator.douyin.com/creator-micro/data/following/chat",
+            )
+
+            logger.debug(f"账号 {username} 开始发送消息")
+            # 滚动并选择用户
+            any_matched = False
+            for friend_name in scroll_and_select_user(page, username, targets):
+                any_matched = True
+                logger.debug(f"账号 {username} 已选中好友 {friend_name} 发送消息")
+                # 等待聊天输入框元素加载完成，使用更稳定的属性选择器
+                chat_input_selector = "xpath=//div[contains(@class, 'chat-input-')]"
+                page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
+                chat_input = page.locator(chat_input_selector)
+
+                # 在 chat-input-dccKiL 中输入内容
+                message = build_message()
+                lines = message.split("\\n")
+                for i, line in enumerate(lines):
+                    chat_input.type(line)  # 输入每一行
+                    # 如果不是最后一行，模拟 Shift+Enter 插入换行
+                    if i != len(lines) - 1:
+                        chat_input.press("Shift+Enter")  # 模拟 Shift+Enter 插入换行
+
+                logger.info(
+                    f"账号 {username} 准备发送消息给好友 {friend_name}：\n\t{message}"
+                )
+                # 模拟按下回车键发送消息
+                chat_input.press("Enter")
+                logger.info(f"账号 {username} 给好友 {friend_name} 发送消息完成")
+                time.sleep(2)  # 发送完等待一会儿
+
+            if not any_matched:
+                logger.warning(
+                    f"账号 {username} 未匹配到任何目标好友 targets={targets}（matchMode={matchMode}）。"
+                    + (" 请确认 targets 中填写的是【好友抖音号】。若创作者中心接口没有回调 ShortId 数据（userIDDict 为空），请改用 nickname 匹配模式并填好友原始昵称。" if matchMode == "short_id" else "")
+                )
+                if matchMode == "short_id":
+                    logger.warning(
+                        f"账号 {username} 当前已收集 userIDDict 条目数: {len(userIDDict)}，内容: {json.dumps(userIDDict, ensure_ascii=False)[:800]}"
+                    )
+
+        except Exception as e:
+            logger.error(
+                f"账号 {username} 执行任务时发生异常: {type(e).__name__}: {e}\n"
+                + traceback.format_exc()
+            )
+            raise
+        finally:
+            try:
+                context.close()  # 任务完成后关闭上下文
+            except Exception:
+                pass
 
 
 def runTasks():
