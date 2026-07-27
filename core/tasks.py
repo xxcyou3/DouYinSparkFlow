@@ -19,10 +19,33 @@ matchMode = config.get("matchMode", "nickname")
 userIDDict = {}
 
 
-CONVERSATION_ITEM_SELECTOR = '[class*="conversationConversationItem"]'
-CONVERSATION_TITLE_SELECTOR = '[class*="conversationConversationItemtitle"]'
-CONVERSATION_LIST_SELECTOR = '[class*="conversationConversationList"]'
-CHAT_EDITOR_SELECTOR = '[class*="messageEditorimChatEditorContainer"]'
+CONVERSATION_ITEM_SELECTOR = (
+    '[class*="conversationConversationItem"],'
+    '[class*="fans-item"],[class*="group-item"],'
+    '[class*="fansItem"],[class*="groupItem"],'
+    '[class*="messageItem"],[class*="message-item"],'
+    '[class*="imItem"],[class*="im-item"],'
+    '[class*="chatItem"],[class*="chat-item"],'
+    '[class*="PrivateChat"] [role="button"],'
+    '[class*="private-chat"] [class*="item"]'
+)
+CONVERSATION_TITLE_SELECTOR = (
+    '[class*="conversationConversationItemtitle"],'
+    '[class*="title"],[class*="name"],[class*="nickname"],'
+    '[class*="fans-item__title"],[class*="group-item__title"]'
+)
+CONVERSATION_LIST_SELECTOR = (
+    '[class*="conversationConversationList"],'
+    '[class*="messageList"],[class*="message-list"],'
+    '[class*="chat-list"],[class*="im-list"],[class*="fans-list"],[class*="group-list"]'
+)
+CHAT_EDITOR_SELECTOR = (
+    '[class*="messageEditorimChatEditorContainer"],'
+    '[contenteditable="true"][class*="editor"],'
+    '[contenteditable="true"][class*="input"],'
+    'textarea[class*="comment"],'
+    'textarea[class*="editor"]'
+)
 SEARCH_INPUT_SELECTOR = '[class*="search-input"]'
 
 
@@ -308,6 +331,104 @@ def wait_chat_page_ready(page, username, max_wait=60):
     _close_login_save_popup(page, username)
     _probe_im_apis(page, username)
     return False
+
+
+def _ensure_creator_message_view(page, username, max_wait=35):
+    """creator 中心不一定真的进入"私信"视图：必要时点击"消息/私信入口，或者直接跳 /creator-micro/message 路径。"""
+    urls_to_try = [
+        "https://creator.douyin.com/creator-micro/message",
+        "https://creator.douyin.com/creator-micro/message?tab=private",
+        "https://creator.douyin.com/creator-micro/data-center/message",
+        "https://creator.douyin.com/creator-micro/interaction/manage",
+    ]
+    need_enter = False
+    try:
+        cur = page.url or ""
+        txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        txt = ""
+    im_kws = ["私信", "全部消息", "会话", "聊天记录", "发送消息", "消息中心", "粉丝消息", "互动消息"]
+    if not any(k in txt for k in im_kws) and not any(u in cur for u in ("/message", "/im")):
+        need_enter = True
+    if not need_enter and "粉丝" in txt and "互动管理" in txt and "数据中心" in txt:
+            need_enter = True
+    if not need_enter:
+        logger.debug(f"creator IM 视图已就位 (url={cur[:90]})")
+        return True
+    logger.info(f"creator 中心还没进入消息视图 (url={cur[:90]})，尝试点击入口+跳转 URL")
+
+    # 1) 先尝试点击页面上可见的「消息/私信/互动管理/粉丝管理入口
+    click_candidates = [
+        "xpath=//div[contains(text(),'消息') and (contains(@class,'tab') or contains(@class,'menu') or contains(@class,'item') or contains(@class,'nav') or self::a or self::button)]",
+        "xpath=//*[self::a or self::button or self::div or self::span][contains(normalize-space(.),'私信')]",
+        "xpath=//*[self::a or self::button][contains(@href,'message') or contains(@href,'im') or contains(@href,'interaction')]",
+        '[class*="message"] [role="button"], [class*="Message"] [onclick*="message"], [class*="icon-message"]',
+        '[class*="mail"] [role="button"], [class*="icon-chat"] [role="button"], [class*="nav"] [class*="im"]',
+    ]
+    clicked_any = False
+    for cx in click_candidates:
+        try:
+            n = page.locator(cx).count()
+            for i in range(min(3, n)):
+                try:
+                    loc = page.locator(cx).nth(i)
+                    try:
+                        vis = loc.is_visible(timeout=600)
+                    except Exception:
+                        vis = True
+                    if not vis:
+                        continue
+                    txt = ""
+                    try:
+                        txt = (loc.inner_text(timeout=600) or "")
+                    except Exception:
+                        pass
+                    if any(k in txt for k in ["首页", "管理首页", "数据中心"]) and not any(
+                        k in txt for k in ["消息", "私信", "互动", "粉丝"]):
+                        continue
+                    loc.click(timeout=1500)
+                    clicked_any = True
+                    time.sleep(2)
+                    break
+                except Exception:
+                    continue
+            if clicked_any:
+                break
+        except Exception:
+            continue
+    if clicked_any:
+        try:
+            page.wait_for_load_state("networkidle", timeout=12000)
+        except Exception:
+            pass
+        time.sleep(2)
+        wait_chat_page_ready(page, username, max_wait=25)
+
+    # 2) 如果点击之后还没就位，就逐个 URL 试
+    try:
+        cur = page.url or ""
+        txt_after = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        txt_after = ""
+    if not any(k in txt_after for k in im_kws):
+        for u in urls_to_try:
+            try:
+                page.goto(u, wait_until="domcontentloaded", timeout=45000)
+            except Exception:
+                pass
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            wait_chat_page_ready(page, username, max_wait=25)
+            try:
+                txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            except Exception:
+                txt = ""
+            if any(k in txt for k in im_kws):
+                logger.info(f"creator 跳转 {u} 已就位")
+                return True
+    return True
 
 
 def _find_conversation_rows(page):
@@ -851,23 +972,24 @@ def do_user_task(browser, username, cookies, targets):
             logger.warning(f"首页疑似未登录（{bad_kw}），仍尝试进入 creator 中心 IM")
 
         retry_operation(
-            "导航到抖音 creator 中心 IM 页面（原始项目路径）",
+            "导航到抖音 creator 中心消息页面（直接 message 专门页）",
             page.goto,
             retries=config["taskRetryTimes"],
             delay=5,
-            url="https://creator.douyin.com/creator-micro/data-center?tab=im",
+            url="https://creator.douyin.com/creator-micro/message",
             wait_until="domcontentloaded",
             timeout=60000,
         )
         try:
             page.reload(wait_until="domcontentloaded", timeout=45000)
         except Exception as e:
-            logger.warning(f"creator IM 页 reload 超时，忽略继续: {e}")
+            logger.warning(f"creator/message 页 reload 超时，忽略继续: {e}")
         try:
             page.wait_for_load_state("networkidle", timeout=20000)
         except Exception:
             pass
         wait_chat_page_ready(page, username, max_wait=60)
+        _ensure_creator_message_view(page, username, max_wait=40)
 
         cur_url = page.url
         logger.debug(f"账号 {username} 当前页面 URL: {cur_url}")
@@ -941,6 +1063,11 @@ def do_user_task(browser, username, cookies, targets):
             logger.debug(f"页面文本前1200字：{body_text[:1200]}")
         except Exception:
             pass
+
+        if len(userIDDict) == 0:
+            logger.info(f"userIDDict 为空，进入好友匹配前再强制探测 9 个接口")
+            _probe_im_apis(page, username)
+            _probe_im_apis(page, username)
 
         any_matched = False
         for friend_name in scroll_and_select_user(page, username, targets):
