@@ -27,7 +27,7 @@ SEARCH_INPUT_SELECTOR = '[class*="search-input"]'
 
 
 def handle_response(response: Response):
-    """监听聊天页多种 IM 接口响应，统一收集多种匹配键。"""
+    """监听多种接口响应（IM+搜索+关注+粉丝+资料），统一收集多种匹配键。"""
     global userIDDict
     try:
         url = response.url
@@ -36,6 +36,13 @@ def handle_response(response: Response):
             or "aweme/v1/creator/im/user_detail" in url
             or "aweme/v1/web/im/user/list" in url
             or "aweme/v1/web/im/conversation/list" in url
+            or "aweme/v1/web/search/sug" in url
+            or "aweme/v1/web/search/user" in url
+            or "aweme/v1/user/profile" in url
+            or "aweme/v1/web/user/profile" in url
+            or "userRelation/v1" in url
+            or "aweme/v1/following" in url
+            or "aweme/v1/fans" in url
             or "im/user" in url or "conversation" in url or "im_friends" in url or "im/friends" in url
         )
         if not interested:
@@ -46,35 +53,31 @@ def handle_response(response: Response):
             return
         candidates_lists = []
         if isinstance(json_data, dict):
-            if isinstance(json_data.get("data"), list):
-                candidates_lists.append(json_data["data"])
-            if isinstance(json_data.get("user_list"), list):
-                candidates_lists.append(json_data["user_list"])
-            if isinstance(json_data.get("conversations"), list):
-                candidates_lists.append(json_data["conversations"])
-            if isinstance(json_data.get("conversation_list"), list):
-                candidates_lists.append(json_data["conversation_list"])
-            if isinstance(json_data.get("friends"), list):
-                candidates_lists.append(json_data["friends"])
-            # 嵌套 data.user_list / data.conversations 等
+            for top in ("data", "user_list", "conversations", "conversation_list", "friends",
+                        "users", "items", "list", "followings", "fans", "sug_list"):
+                if isinstance(json_data.get(top), list):
+                    candidates_lists.append(json_data[top])
             if isinstance(json_data.get("data"), dict):
                 inner = json_data["data"]
-                for kk in ("user_list", "data", "list", "conversations", "conversation_list", "friends", "items"):
+                for kk in ("user_list", "data", "list", "conversations", "conversation_list",
+                           "friends", "items", "users", "followings", "fans", "sug_list", "info", "user"):
                     if isinstance(inner.get(kk), list):
                         candidates_lists.append(inner[kk])
+                    elif kk == "user" and isinstance(inner.get(kk), dict):
+                        candidates_lists.append([inner[kk]])
         for items in candidates_lists:
             for raw in items:
                 if not isinstance(raw, dict):
                     continue
-                # 两种结构：外层带 user 字段 / 直接平铺字段
                 u = raw.get("user") if isinstance(raw.get("user"), dict) else raw
                 short_id = str(u.get("short_id") or u.get("shortId") or raw.get("short_id") or "")
                 unique_id = str(u.get("unique_id") or u.get("uniqueId") or raw.get("unique_id") or "")
                 sec_uid = str(u.get("sec_uid") or u.get("secUid") or raw.get("sec_uid") or "")
-                nickname = norm(u.get("nickname") or raw.get("nickname"))
+                nickname = norm(u.get("nickname") or raw.get("nickname") or raw.get("display_nickname"))
                 remark_name = norm(u.get("remark_name") or u.get("remarkName") or raw.get("remark_name")) or nickname
-                user_id = str(u.get("user_id") or u.get("userId") or raw.get("user_id") or "")
-                if not (short_id or unique_id or sec_uid or nickname):
+                user_id = str(u.get("user_id") or u.get("userId") or raw.get("user_id") or
+                              u.get("uid") or raw.get("uid") or "")
+                if not (short_id or unique_id or sec_uid or nickname or user_id):
                     continue
                 info = {
                     "short_id": short_id,
@@ -94,7 +97,7 @@ def handle_response(response: Response):
     except Exception as e:
         tb = traceback.extract_tb(e.__traceback__)
         last = tb[-1] if tb else None
-        logger.debug(f"解析 IM 接口响应失败: {e} @ {getattr(last,'filename','?')}:{getattr(last,'lineno','?')}")
+        logger.debug(f"解析接口响应失败: {e} @ {getattr(last,'filename','?')}:{getattr(last,'lineno','?')}")
 
 
 def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
@@ -197,58 +200,80 @@ def _close_login_save_popup(page, username):
 
 
 def _probe_im_apis(page, username):
-    """主动调用聊天相关接口，填充 userIDDict，并返回接口返回快照用于日志。"""
+    """主动调用聊天/搜索/关注相关接口，避免跨域，base 用当前 location.origin。"""
     global userIDDict
     snap = {}
     try:
         snap = page.evaluate("""async () => {
             const res = {};
+            const origin = (location && location.origin) ? location.origin : 'https://www.douyin.com';
+            const common = 'version_code=1700&device_platform=webapp&aid=6383&webcast_sdk_version=1700';
             const urls = [
-                'https://www.douyin.com/aweme/v1/web/im/user/info/?cursor=0&user_source=0&count=100&version_code=1700&device_platform=webapp&aid=6383',
-                'https://www.douyin.com/aweme/v1/web/im/conversation/list/?cursor=0&count=50&version_code=1700&device_platform=webapp&aid=6383',
-                'https://www.douyin.com/aweme/v1/web/im/user/list/?cursor=0&count=100&version_code=1700&device_platform=webapp&aid=6383',
-                'https://creator.douyin.com/aweme/v1/creator/im/user_detail/?user_source=0&count=100&cursor=0&version_code=1700&device_platform=webapp&aid=6383',
+                origin + '/aweme/v1/web/im/user/info/?cursor=0&user_source=0&count=100&' + common,
+                origin + '/aweme/v1/web/im/conversation/list/?cursor=0&count=50&' + common,
+                origin + '/aweme/v1/web/im/user/list/?cursor=0&count=100&' + common,
+                'https://creator.douyin.com/aweme/v1/creator/im/user_detail/?user_source=0&count=100&cursor=0&' + common,
+                origin + '/aweme/v1/user/following/list/?user_id=&max_time=0&count=50&' + common,
+                origin + '/aweme/v1/web/following/list/?user_id=&max_time=0&count=50&' + common,
+                origin + '/aweme/v1/user/follower/list/?user_id=&max_time=0&count=50&' + common,
+                origin + '/aweme/v1/web/search/sug/?keyword=搜索&from_group_id=&source=general&type=1&' + common,
+                origin + '/passport/web/user/info/?aid=6383&device_platform=webapp',
             ];
             for (let i = 0; i < urls.length; i++) {
                 try {
-                    const r = await fetch(urls[i], {credentials:'include'});
+                    const u = urls[i];
+                    const r = await fetch(u, {credentials:'include', mode:'cors'}).catch(err => ({err}));
+                    if (r && r.err) { res['e'+i] = String(r.err).slice(0,200); continue; }
                     const t = await r.text();
                     res['u'+i] = (t || '').slice(0, 500);
                     res['s'+i] = r.status;
                 } catch(e) {
                     res['e'+i] = String(e).slice(0,200);
                 }
-                await new Promise(r => setTimeout(r, 500));
+                await new Promise(r => setTimeout(r, 350));
             }
             return res;
         }""")
-        logger.debug(
-            f"账号 {username} 主动探测 4 个 IM 接口结果："
-            + " ".join(f"{k}={snap[k]!r}" for k in sorted(snap.keys()) if str(snap[k])[:4] not in ("<htm",))
-        )
+        parts = []
+        for k in sorted(snap.keys()):
+            v = snap[k]
+            sv = str(v)
+            if sv[:4] in ("<htm",):
+                continue
+            if k.startswith("u"):
+                sv = sv.replace("\n", " ")[:300]
+            parts.append(f"{k}={sv!r}")
+        logger.debug(f"账号 {username} 主动探测 9 个接口结果：" + " ".join(parts))
     except Exception as e:
         logger.debug(f"探测接口异常: {e}")
-    # 等待 2 秒，给 handle_response 时间处理
     time.sleep(2.5)
     return snap
 
 
 def wait_chat_page_ready(page, username, max_wait=60):
-    """轮询等待：关掉阻塞弹窗 + 骨架屏消失 + 有真实聊天内容。"""
+    """轮询等待：关阻塞弹窗 + 骨架屏消失 + 有真实聊天内容（非空壳）。"""
     global userIDDict
     def _is_still_blocked():
         try:
             txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
         except Exception:
             txt = ""
-        # 有阻塞弹窗（保存登录信息/扫码登录）优先判定为阻塞
-        block_kw = ["是否保存登录信息", "下次登录更便捷", "个人中心关闭", "扫码登录", "请先登录", "立即登录", "手机号登录", "密码登录"]
+        # 有阻塞弹窗/登录提示优先判定为阻塞
+        block_kw = [
+            "是否保存登录信息", "下次登录更便捷", "个人中心关闭",
+            "扫码登录", "请先登录", "立即登录", "手机号登录", "密码登录",
+            "请使用抖音扫码", "请使用抖音APP扫码", "登录后查看", "登录后可查看",
+            "短信登录", "验证码登录", "验证手机号",
+        ]
         if any(k in txt for k in block_kw):
             return True
         lines = [l.strip() for l in txt.splitlines() if l.strip()]
-        # 骨架屏 + 极少文本
-        if len(lines) <= 4 and "抖音聊天" in txt:
-            extra = ["发送", "消息", "会话", "朋友", "粉丝", "好友", "聊天记录", "搜索", "今日", "昨天", "刚刚"]
+        # 空壳拦截：body 可见字符 < 50，或者行数 <= 3（只有读屏标签等极少内容） → 还没加载出来
+        if len(lines) <= 3 or len("".join(lines)) < 50:
+            return True
+        # 骨架屏：有「抖音聊天」但没有真实 UI 文字
+        if "抖音聊天" in txt or "聊天" in txt and len(lines) <= 5:
+            extra = ["发送", "消息", "会话", "朋友", "粉丝", "好友", "聊天记录", "搜索", "今日", "昨天", "刚刚", "私信", "全部", "消息中心"]
             if not any(k in txt for k in extra):
                 return True
         return False
@@ -257,17 +282,14 @@ def wait_chat_page_ready(page, username, max_wait=60):
     skel_rounds = 0
     closed_popup_once = False
     while time.time() - start < max_wait:
-        # 每轮先尝试关弹窗
         if _close_login_save_popup(page, username):
             closed_popup_once = True
         if not _is_still_blocked():
-            # 再看一眼 userIDDict，如果还是 0，主动探测一次
             if len(userIDDict) == 0 and skel_rounds >= 2:
                 _probe_im_apis(page, username)
             logger.debug(f"账号 {username} 聊天页加载完毕（关过弹窗={closed_popup_once}），userIDDict={len(userIDDict)} 条")
             return True
         skel_rounds += 1
-        # 每 2 轮探测一次接口（强制喂数据给 handle_response）
         if skel_rounds % 2 == 1:
             _probe_im_apis(page, username)
             try:
@@ -279,10 +301,10 @@ def wait_chat_page_ready(page, username, max_wait=60):
         time.sleep(3)
     body_txt = ""
     try:
-        body_txt = page.evaluate("() => document.body ? document.body.innerText.slice(0, 800) : ''") or ""
+        body_txt = page.evaluate("() => document.body ? document.body.innerText.slice(0, 1000) : ''") or ""
     except Exception:
         pass
-    logger.warning(f"账号 {username} 聊天页等待超时({max_wait}s)，关过弹窗={closed_popup_once}。body前800字：{body_txt[:800]}")
+    logger.warning(f"账号 {username} 聊天页等待超时({max_wait}s)，关过弹窗={closed_popup_once}。body前1000字：{body_txt[:1000]}")
     _close_login_save_popup(page, username)
     _probe_im_apis(page, username)
     return False
@@ -448,7 +470,7 @@ def _try_search_and_enter(page, username, targets):
 
 def scroll_and_select_user(page, username, targets):
     """三重策略：① class 前缀匹配(dev 老方案) ② DOM 结构找会话行 ③ 搜索框兜底。"""
-    logger.debug(f"账号 {username} 开始查找目标好友列表（www.douyin.com/chat），targets={targets}")
+    logger.debug(f"账号 {username} 开始查找目标好友列表（creator IM），targets={targets}")
 
     found_targets = set()
     remaining_targets = set(targets)
@@ -806,22 +828,46 @@ def do_user_task(browser, username, cookies, targets):
         logger.debug(f"账号 {username} 已注入 {len(cookies)} 条 Cookie（三重保险）")
 
         retry_operation(
-            "导航到抖音聊天页",
+            "导航到抖音首页（种 Cookie + 验证登录态）",
             page.goto,
             retries=config["taskRetryTimes"],
             delay=5,
-            url="https://www.douyin.com/chat",
+            url="https://www.douyin.com/",
             wait_until="domcontentloaded",
+            timeout=60000,
         )
         try:
-            page.reload(wait_until="domcontentloaded")
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        try:
+            body_home = page.evaluate("() => document.body ? document.body.innerText.slice(0,1000) : ''") or ""
+        except Exception:
+            body_home = ""
+        bad_kw = [k for k in ["扫码登录", "请先登录", "立即登录", "登录/注册", "手机号登录"] if k in body_home]
+        good_kw = [k for k in ["推荐", "热榜", "关注", "搜索", "首页", "消息"] if k in body_home]
+        logger.debug(f"账号 {username} 首页登录特征：bad={bad_kw} good={good_kw}")
+        if bad_kw and not good_kw:
+            logger.warning(f"首页疑似未登录（{bad_kw}），仍尝试进入 creator 中心 IM")
+
+        retry_operation(
+            "导航到抖音 creator 中心 IM 页面（原始项目路径）",
+            page.goto,
+            retries=config["taskRetryTimes"],
+            delay=5,
+            url="https://creator.douyin.com/creator-micro/data-center?tab=im",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=45000)
         except Exception as e:
-            logger.warning(f"聊天页 reload 超时，忽略继续: {e}")
+            logger.warning(f"creator IM 页 reload 超时，忽略继续: {e}")
         try:
             page.wait_for_load_state("networkidle", timeout=20000)
         except Exception:
             pass
-        wait_chat_page_ready(page, username, max_wait=50)
+        wait_chat_page_ready(page, username, max_wait=60)
 
         cur_url = page.url
         logger.debug(f"账号 {username} 当前页面 URL: {cur_url}")
@@ -846,8 +892,9 @@ def do_user_task(browser, username, cookies, targets):
         login_keywords = ["扫码登录", "请先登录", "立即登录", "未登录", "手机号登录", "密码登录", "登录/注册"]
         hit_keywords = [kw for kw in login_keywords if kw in body_text]
         login_hints = [
-            "聊天", "消息", "会话", "发送", "朋友", "粉丝",
-            "conversation", "搜索", "聊天记录",
+            "聊天", "消息", "会话", "发送", "朋友", "粉丝", "私信",
+            "conversation", "搜索", "聊天记录", "互动管理", "数据中心",
+            "全部消息", "好友",
         ]
         hint_hit = [h for h in login_hints if h in body_text]
 
