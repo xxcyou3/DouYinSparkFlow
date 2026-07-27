@@ -151,9 +151,19 @@ def get_userData():
             continue
         cookies_key = f"cookies_{unique_id}".upper()
         raw_cookies_str = os.getenv(cookies_key, "")
+        # [修复] 如果找不到 COOKIES_{UNIQUE_ID}，回退到 COOKIES（通用兜底），避免 unique_id 拼写错导致空 cookie
+        used_key = cookies_key
+        if not raw_cookies_str:
+            fallback_key = "COOKIES"
+            raw_cookies_str = os.getenv(fallback_key, "")
+            if raw_cookies_str:
+                used_key = fallback_key
+                logger.warning(
+                    f"{username} 的任务 未找到 {cookies_key}，已回退使用通用变量 {fallback_key}（请确认 unique_id 是否一致）"
+                )
         if not raw_cookies_str:
             logger.warning(
-                f"{username} 的任务 缺少 {cookies_key} 环境变量，已跳过"
+                f"{username} 的任务 缺少 {cookies_key} （通用变量 COOKIES 也为空），已跳过"
             )
             continue
         # [修复] 不要用 unicode_escape 转换，否则 cookie value 中 \u、%u、反斜杠等会被错误解码
@@ -168,10 +178,21 @@ def get_userData():
             # 兼容：GitHub Actions 把变量里的 " 自动转义成 \"，这里尝试反解一次
             try:
                 cookies = json.loads(cookies_str.encode("utf-8").decode("unicode_escape"))
-                logger.warning(f"{username} 的任务 {cookies_key} 通过 unicode_escape 兼容解析成功（建议原始 Cookie JSON 不要多包一层引号）")
+                logger.warning(f"{username} 的任务 {used_key} 通过 unicode_escape 兼容解析成功（建议原始 Cookie JSON 不要多包一层引号）")
             except Exception:
-                logger.warning(f"{username} 的任务 {cookies_key} 格式不正确，已跳过")
+                logger.warning(f"{username} 的任务 {used_key} 格式不正确，已跳过")
                 continue
+
+        # [修复] 解析成功后，日志里打印 sessionid 前 16 位，方便快速判断是不是最新 cookie
+        sid = ""
+        for c in cookies:
+            if isinstance(c, dict) and str(c.get("name")) == "sessionid":
+                sid = str(c.get("value", ""))
+                break
+        logger.info(
+            f"{username} 的任务 Cookie 来源变量={used_key}，共 {len(cookies)} 条，"
+            f"sessionid 前16={sid[:16]!r} uid_tt 前12={next((str(c.get('value',''))[:12] for c in cookies if isinstance(c,dict) and str(c.get('name'))=='uid_tt'), '-')!r}"
+        )
 
         userData.append(
             {
