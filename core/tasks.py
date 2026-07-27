@@ -99,8 +99,218 @@ def checkTargetName(targetName, targets):
     return None
 
 
+def wait_chat_page_ready(page, username, max_wait=45):
+    """轮询等待聊天页骨架屏消失（真实会话内容渲染出来），主动触发 web/im/user/info 接口填充 userIDDict。"""
+    global userIDDict
+    def _is_skeleton_only():
+        try:
+            txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+        except Exception:
+            txt = ""
+        lines = [l.strip() for l in txt.splitlines() if l.strip()]
+        # 骨架屏特征：页面只有 0-3 行非空文本，包含「抖音聊天」但没有任何真实会话文字（没有「发送/搜索/朋友/会话/消息」等词）
+        if len(lines) <= 4 and "抖音聊天" in txt:
+            extra_keywords = ["发送", "消息", "会话", "朋友", "粉丝", "好友", "聊天记录", "搜索"]
+            if not any(k in txt for k in extra_keywords):
+                return True
+        return False
+
+    start = time.time()
+    skel_rounds = 0
+    while time.time() - start < max_wait:
+        if not _is_skeleton_only():
+            logger.debug(f"账号 {username} 聊天页骨架屏已消失，开始交互")
+            return True
+        skel_rounds += 1
+        # 每 3 秒主动触发一次 user/info 接口，强制页面去拉数据（顺便填充 userIDDict）
+        if skel_rounds % 2 == 1:
+            try:
+                page.evaluate("""async () => {
+                    try {
+                        const base = 'https://www.douyin.com/aweme/v1/web/im/user/info/';
+                        for (let count = 20; count <= 120; count += 20) {
+                            try {
+                                const u = base + '?cursor=0&user_source=0&count=' + count + '&version_code=1700&device_platform=webapp&aid=6383';
+                                await fetch(u, {credentials:'include'}).then(r=>r.text()).catch(()=>{});
+                                await new Promise(r => setTimeout(r, 500));
+                            } catch(e) {}
+                        }
+                    } catch(e) {}
+                }""")
+                logger.debug(f"账号 {username} 已主动触发 user/info 接口，当前 userIDDict={len(userIDDict)} 条")
+            except Exception as e:
+                logger.debug(f"主动触发 user/info 失败: {e}")
+            # 尝试点击页面中心一下，触发懒加载
+            try:
+                vw = page.evaluate("() => window.innerWidth || 1440")
+                vh = page.evaluate("() => window.innerHeight || 900")
+                page.mouse.click(vw / 2, vh / 2)
+            except Exception:
+                pass
+        time.sleep(3)
+    body_txt = ""
+    try:
+        body_txt = page.evaluate("() => document.body ? document.body.innerText.slice(0, 600) : ''") or ""
+    except Exception:
+        pass
+    logger.warning(f"账号 {username} 聊天页等待 {max_wait}s 仍疑似骨架屏。body前600字：{body_txt[:600]}")
+    return False
+
+
+def _find_conversation_rows(page):
+    """哈希 class 全失效时兜底：用 DOM 结构特征找会话行（左侧有圆形头像+昵称+两行文本的列表项），返回 Locator list。"""
+    try:
+        found = page.evaluate("""() => {
+            const rows = [];
+            const all = document.querySelectorAll('div');
+            for (let i = 0; i < all.length; i++) {
+                const el = all[i];
+                const cs = getComputedStyle(el);
+                const h = parseFloat(cs.height);
+                const w = parseFloat(cs.width);
+                const disp = cs.display;
+                if (disp === 'none' || h < 48 || h > 140 || w < 100) continue;
+                // 特征：display 是 flex/grid 或有 3+ 个子元素
+                const kids = Array.from(el.children || []);
+                if (kids.length < 2 || kids.length > 12) continue;
+                // 子元素里应该有：一个头像（border-radius 接近50%/100% 或圆形img）+ 至少一个文本节点
+                let hasAvatar = false;
+                let hasText = false;
+                let textSample = '';
+                for (const k of kids) {
+                    const kcs = getComputedStyle(k);
+                    const br = parseFloat(kcs.borderRadius);
+                    const kh = parseFloat(kcs.height);
+                    const kw = parseFloat(kcs.width);
+                    if ((br > 0 && Math.abs(br - kh/2) < kh*0.2) || (kh > 20 && kh < 80 && Math.abs(kh-kw) < 10)) {
+                        hasAvatar = true;
+                    }
+                    const t = (k.innerText || '').trim();
+                    if (t && t.length < 40) {
+                        if (!textSample) textSample = t.split(/\\n/)[0].trim();
+                        if (textSample) hasText = true;
+                    }
+                }
+                if (hasAvatar && hasText && textSample && !/^(直播|加载|骨架)$/.test(textSample)) {
+                    rows.push({index: i, text: textSample});
+                }
+            }
+            return rows.slice(0, 50);
+        }""")
+        if not found:
+            return []
+        locs = []
+        for r in found:
+            try:
+                loc = page.evaluate_handle(
+                    "(idx) => document.querySelectorAll('div')[idx]",
+                    r["index"],
+                )
+                if loc:
+                    from playwright.sync_api import Locator
+                    locs.append((r["text"], loc.as_element()))
+            except Exception:
+                continue
+        return locs
+    except Exception as e:
+        logger.debug(f"DOM 结构找会话行异常: {e}")
+        return []
+
+
+def _try_search_and_enter(page, username, targets):
+    """终极兜底：在聊天页找搜索框，输入目标抖音号/昵称，搜索后进入第一个结果。"""
+    search_candidates = [
+        'input[placeholder*="搜索"]',
+        'input[placeholder*="search" i]',
+        'div[contenteditable="true"][data-placeholder*="搜索"]',
+        'textarea[placeholder*="搜索"]',
+        '[class*="search"] input',
+        '[class*="Search"] input',
+    ]
+    search_loc = None
+    for sc in search_candidates:
+        try:
+            n = page.locator(sc).count()
+            if n > 0:
+                search_loc = page.locator(sc).first
+                logger.debug(f"账号 {username} 找到搜索框选择器: {sc}")
+                break
+        except Exception:
+            continue
+    if search_loc is None:
+        # 再兜底：所有 input 里第一个可见的
+        try:
+            for i in range(min(page.locator("input").count(), 6)):
+                cand = page.locator("input").nth(i)
+                if cand.is_visible(timeout=800):
+                    search_loc = cand
+                    break
+        except Exception:
+            pass
+    if search_loc is None:
+        logger.warning(f"账号 {username} 没找到搜索框，跳过 search 兜底")
+        return False
+
+    matched_any = False
+    for t in list(targets):
+        try:
+            logger.info(f"账号 {username} 尝试用搜索框搜索目标 {t!r}")
+            search_loc.click(timeout=2000)
+            time.sleep(0.3)
+            # 清空
+            try:
+                search_loc.fill("")
+                for _ in range(3):
+                    search_loc.press("End")
+                    search_loc.press("Backspace")
+            except Exception:
+                pass
+            search_loc.type(str(t), timeout=4000)
+            time.sleep(0.5)
+            search_loc.press("Enter")
+            time.sleep(2.5)
+            # 点第一个搜索结果
+            clicked = False
+            for sel in (
+                '[class*="result"] >> nth=0',
+                '[class*="Result"] >> nth=0',
+                '[class*="search"] [class*="item"] >> nth=0',
+                'li >> nth=0',
+            ):
+                try:
+                    cand = page.locator(sel)
+                    if cand.count() > 0 and cand.first.is_visible(timeout=1000):
+                        cand.first.click(timeout=2000)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                # 直接按 Enter 选中第一个
+                page.keyboard.press("Enter")
+                time.sleep(0.5)
+                page.keyboard.press("Enter")
+            time.sleep(2)
+            # 判定是否成功进入：看是否有 contenteditable 输入框
+            has_editor = False
+            for fsel in ('[contenteditable="true"]', '[class*="chat-input"]', 'textarea'):
+                try:
+                    if page.locator(fsel).count() > 0:
+                        has_editor = True
+                        break
+                except Exception:
+                    continue
+            if has_editor:
+                logger.info(f"账号 {username} 搜索 {t!r} 后疑似进入会话（输入框已出现）")
+                matched_any = True
+                yield t
+        except Exception as e:
+            logger.warning(f"搜索 {t!r} 异常: {e}")
+    return matched_any
+
+
 def scroll_and_select_user(page, username, targets):
-    """www.douyin.com/chat 会话列表：class 模糊匹配 + 滚动加载 + 智能匹配。"""
+    """三重策略：① class 前缀匹配(dev 老方案) ② DOM 结构找会话行 ③ 搜索框兜底。"""
     logger.debug(f"账号 {username} 开始查找目标好友列表（www.douyin.com/chat），targets={targets}")
 
     found_targets = set()
@@ -108,49 +318,93 @@ def scroll_and_select_user(page, username, targets):
     empty_scroll_count = 0
     MAX_EMPTY_SCROLLS = 10
 
-    for _round in range(30):
+    for _round in range(25):
+        target_elements_info = []  # list of (text, handle_or_locator)
+        # Strategy 1: dev 分支的旧 class 选择器
         try:
-            target_elements = page.locator(CONVERSATION_ITEM_SELECTOR).all()
-        except Exception as e:
-            logger.debug(f"查找会话项异常（第{_round}轮）: {e}")
-            target_elements = []
+            n = page.locator(CONVERSATION_ITEM_SELECTOR).count()
+            if n > 0:
+                for i in range(n):
+                    try:
+                        loc = page.locator(CONVERSATION_ITEM_SELECTOR).nth(i)
+                        try:
+                            t = loc.locator(CONVERSATION_TITLE_SELECTOR).first.inner_text(timeout=800)
+                        except Exception:
+                            t = loc.inner_text(timeout=800).splitlines()[0]
+                        t = norm(t)
+                        if t:
+                            target_elements_info.append((t, loc))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        # Strategy 2: DOM 结构特征兜底
+        if not target_elements_info:
+            rows = _find_conversation_rows(page)
+            for txt, el in rows:
+                if el is not None:
+                    target_elements_info.append((norm(txt), el))
+        # Strategy 2b: 直接拿 body 里所有非空行文本做一层伪匹配（如果 DOM 里还是没有元素但 userIDDict 有）
+        if not target_elements_info and len(userIDDict) > 0:
+            try:
+                all_txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+                for line in all_txt.splitlines():
+                    ll = norm(line)
+                    if not ll or len(ll) < 2 or ll in found_targets:
+                        continue
+                    if len(ll) > 30:
+                        continue
+                    target_elements_info.append((ll, None))
+            except Exception:
+                pass
+
+        if not target_elements_info:
+            logger.debug(f"第 {_round} 轮没有任何会话候选，滚动/等待")
+            try:
+                page.evaluate("window.scrollBy(0, 500)")
+            except Exception:
+                pass
+            time.sleep(1.8)
+            empty_scroll_count += 1
+            if empty_scroll_count >= MAX_EMPTY_SCROLLS + 5:
+                break
+            continue
 
         prev_found_count = len(found_targets)
         matched_in_round = False
 
-        for element in target_elements:
+        for targetName, element in target_elements_info:
             try:
-                try:
-                    title_el = element.locator(CONVERSATION_TITLE_SELECTOR).first
-                    targetName = title_el.inner_text(timeout=1200) if title_el.count() > 0 else ""
-                except Exception:
-                    targetName = ""
-                if not targetName:
-                    try:
-                        targetName = element.inner_text(timeout=1200).splitlines()[0]
-                    except Exception:
-                        targetName = ""
                 targetName = norm(targetName)
                 if not targetName or targetName in found_targets:
                     continue
                 found_targets.add(targetName)
-                logger.debug(f"账号 {username} 找到会话 {targetName!r}")
+                logger.debug(f"账号 {username} 找到候选会话 {targetName!r}")
 
                 targetSymbol = checkTargetName(targetName, targets)
                 if targetSymbol:
-                    try:
-                        element.scroll_into_view_if_needed(timeout=1500)
-                        element.click(timeout=2500)
-                    except Exception as e:
-                        logger.warning(f"点击会话项失败，重试: {e}")
+                    if element is not None:
                         try:
-                            box = element.bounding_box()
-                            if box:
-                                page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                            else:
+                            if hasattr(element, "scroll_into_view_if_needed"):
+                                element.scroll_into_view_if_needed(timeout=1500)
+                            if hasattr(element, "click"):
                                 element.click(timeout=2500)
-                        except Exception:
-                            continue
+                            else:
+                                # JS element
+                                page.evaluate("(e) => e && e.click && e.click()", element)
+                        except Exception as e:
+                            logger.warning(f"点击会话项失败（DOM 句柄），重试 bounding_box: {e}")
+                            try:
+                                box = element.bounding_box() if hasattr(element, "bounding_box") else None
+                                if box:
+                                    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                                else:
+                                    page.mouse.click(600, 400)
+                            except Exception:
+                                continue
+                    else:
+                        # element=None：纯文本命中 userIDDict，尝试用搜索框兜底下
+                        pass
                     time.sleep(1.5)
                     logger.info(f"账号 {username} 已选中目标会话 {targetName!r}（匹配键={targetSymbol!r}）")
                     matched_in_round = True
@@ -172,13 +426,28 @@ def scroll_and_select_user(page, username, targets):
             empty_scroll_count += 1
 
         if empty_scroll_count >= MAX_EMPTY_SCROLLS:
-            logger.warning(f"账号 {username} 连续 {MAX_EMPTY_SCROLLS} 次滚动无新会话，停止搜索")
+            logger.warning(f"账号 {username} 连续 {MAX_EMPTY_SCROLLS} 轮滚动无新会话/未匹配，尝试搜索框兜底")
+            # 搜索框兜底
             if remaining_targets:
-                logger.warning(f"仍未匹配的目标: {remaining_targets}")
+                search_gen = _try_search_and_enter(page, username, remaining_targets)
+                try:
+                    for t in search_gen:
+                        matched_in_round = True
+                        yield t
+                        try:
+                            remaining_targets.discard(t)
+                        except Exception:
+                            pass
+                        if len(remaining_targets) == 0:
+                            return
+                except Exception as e:
+                    logger.warning(f"搜索框兜底生成器异常: {e}")
             break
 
+        # 滚动
         try:
             scroll_el = page.locator(CONVERSATION_LIST_SELECTOR).first
+            scrolled = False
             if scroll_el.count() > 0:
                 eh = scroll_el.element_handle()
                 if eh:
@@ -186,17 +455,12 @@ def scroll_and_select_user(page, username, targets):
                     page.evaluate("e => e.scrollTop += 600", eh)
                     time.sleep(0.3)
                     st_after = page.evaluate("e => e.scrollTop", eh)
-                    if st_before == st_after:
-                        empty_scroll_count += 1
-                        logger.debug(f"scrollTop 未变 ({st_before})，可能到底")
-                    else:
+                    if st_before != st_after:
+                        scrolled = True
                         logger.debug(f"会话列表滚动 {st_before}->{st_after}")
-                else:
-                    page.evaluate("window.scrollBy(0, 600)")
-            else:
+            if not scrolled:
                 page.evaluate("window.scrollBy(0, 600)")
-        except Exception as e:
-            logger.debug(f"滚动异常: {e}")
+        except Exception:
             try:
                 page.evaluate("window.scrollBy(0, 600)")
             except Exception:
@@ -204,9 +468,9 @@ def scroll_and_select_user(page, username, targets):
         time.sleep(1.2)
 
     if remaining_targets:
-        logger.warning(f"账号 {username} 结束搜索，仍未匹配: {remaining_targets}（userIDDict 当前条目={len(userIDDict)}）")
+        logger.warning(f"账号 {username} 搜索结束，仍未匹配: {remaining_targets}（userIDDict={len(userIDDict)} 条）")
         if len(userIDDict) < 5:
-            logger.debug(f"userIDDict 内容: {json.dumps(userIDDict, ensure_ascii=False)[:800]}")
+            logger.debug(f"userIDDict: {json.dumps(userIDDict, ensure_ascii=False)[:800]}")
 
 
 def do_user_task(browser, username, cookies, targets):
@@ -397,7 +661,7 @@ def do_user_task(browser, username, cookies, targets):
             page.wait_for_load_state("networkidle", timeout=20000)
         except Exception:
             pass
-        time.sleep(5)
+        wait_chat_page_ready(page, username, max_wait=50)
 
         cur_url = page.url
         logger.debug(f"账号 {username} 当前页面 URL: {cur_url}")
