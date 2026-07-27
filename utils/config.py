@@ -59,10 +59,74 @@ def get_config():
     return config
 
 def sanitize_cookies(cookies):
-    for cookie in cookies:
-        if "sameSite" in cookie:
-            cookie.pop("sameSite")  # 移除 sameSite 字段，Playwright 可能不支持该字段
-    return cookies
+    """
+    清洗和扩展 Cookie：
+    1) 移除 Playwright 1.40+ 不支持的 sameSite（非标准枚举值）和 expires（应该用 expires 时间戳 Unix timestamp，如果是字符串格式则移除）
+    2) 如果传入的 domain 是 .douyin.com 这种顶级通配，同时再注入一份更具体域名的变体（.creator.douyin.com, creator.douyin.com, .passport.douyin.com, www.douyin.com），
+       因为抖音不同子系统在不同子域名上会校验 Cookie，防止单点 domain 不全导致登录失效。
+    3) 按 (name, domain, path) 去重
+    """
+    import time as _time
+    cleaned = []
+    seen = set()
+    if not isinstance(cookies, list):
+        return cleaned
+    now_unix = int(_time.time())
+    for c in cookies:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name", "")).strip()
+        if not name:
+            continue
+        value = str(c.get("value", "")) if c.get("value") is not None else ""
+        domain = c.get("domain", ".douyin.com")
+        path = c.get("path", "/") or "/"
+        # 移除不支持或错误的字段
+        for bad_key in ("sameSite", "same_site", "priority", "sameparty", "sourceScheme", "sourcePort", "partitionKey"):
+            c.pop(bad_key, None)
+        # expires 处理：非整数（比如是 RFC 日期字符串）就移除；过期时间戳已经过了也移除
+        if "expires" in c:
+            exp = c["expires"]
+            if isinstance(exp, (int, float)):
+                ts = int(exp)
+                if 0 < ts < now_unix:  # 已经过期
+                    continue
+                c["expires"] = ts
+            else:
+                c.pop("expires", None)
+        # 保证存在基础字段
+        base = {"name": name, "value": value, "domain": domain, "path": path}
+        for k, v in base.items():
+            c[k] = v
+        key = (name, domain, path)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(c)
+
+    # 2. Domain 扩展：把 .douyin.com 的 cookie 克隆一份到常见子域名
+    extra = []
+    EXTRA_DOMAINS = (".creator.douyin.com", "creator.douyin.com",
+                     ".passport.douyin.com", "passport.douyin.com",
+                     ".www.douyin.com", "www.douyin.com",
+                     ".douyin.com")  # 兜底
+    for c in list(cleaned):
+        dom = (c.get("domain") or "").lower()
+        # 只对抖音相关主域 cookie 扩展
+        if not (dom == ".douyin.com" or dom == "douyin.com" or dom.endswith(".douyin.com")):
+            continue
+        for ed in EXTRA_DOMAINS:
+            if ed == dom:
+                continue
+            nc = dict(c)
+            nc["domain"] = ed
+            k = (nc["name"], nc["domain"], nc.get("path", "/"))
+            if k in seen:
+                continue
+            seen.add(k)
+            extra.append(nc)
+    cleaned.extend(extra)
+    return cleaned
 
 
 def get_userData():
@@ -86,19 +150,28 @@ def get_userData():
             logger.warning(f"{username} 的任务  缺少 unique_id 字段，已跳过")
             continue
         cookies_key = f"cookies_{unique_id}".upper()
-        cookies_str = (
-            os.getenv(cookies_key, "").encode("utf-8").decode("unicode_escape")
-        )
-        if not cookies_str:
+        raw_cookies_str = os.getenv(cookies_key, "")
+        if not raw_cookies_str:
             logger.warning(
                 f"{username} 的任务 缺少 {cookies_key} 环境变量，已跳过"
             )
             continue
+        # [修复] 不要用 unicode_escape 转换，否则 cookie value 中 \u、%u、反斜杠等会被错误解码
+        # 仅兜底：如果字符串首尾都带 " 或 ' ，做一次 strip，支持粘贴时多包了一层
+        cookies_str = raw_cookies_str.strip()
+        if (len(cookies_str) >= 2 and ((cookies_str[0] == '"' and cookies_str[-1] == '"')
+                                        or (cookies_str[0] == "'" and cookies_str[-1] == "'"))):
+            cookies_str = cookies_str[1:-1]
         try:
             cookies = json.loads(cookies_str)
         except json.JSONDecodeError:
-            logger.warning(f"{username} 的任务 {cookies_key} 格式不正确，已跳过")
-            continue
+            # 兼容：GitHub Actions 把变量里的 " 自动转义成 \"，这里尝试反解一次
+            try:
+                cookies = json.loads(cookies_str.encode("utf-8").decode("unicode_escape"))
+                logger.warning(f"{username} 的任务 {cookies_key} 通过 unicode_escape 兼容解析成功（建议原始 Cookie JSON 不要多包一层引号）")
+            except Exception:
+                logger.warning(f"{username} 的任务 {cookies_key} 格式不正确，已跳过")
+                continue
 
         userData.append(
             {

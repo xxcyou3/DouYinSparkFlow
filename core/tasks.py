@@ -6,6 +6,7 @@ from core.browser import get_browser
 from playwright.sync_api import Response
 import time
 import json
+import urllib.parse
 
 
 complates = {}
@@ -228,6 +229,86 @@ def do_user_task(browser, username, cookies, targets):
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/128.0.0.0 Safari/537.36"
             )
+            # === [深度修复] 构建 Playwright storage_state（含 cookies + localStorage/sessionStorage 指纹） ===
+            # 把已扩展的 cookies 直接放在 storage_state 里，而不是先 goto 再 add_cookies，
+            # 这样首次网络请求就会带着完整的 Cookie 头，避免先以未登录状态访问被抖音风控标记。
+            storage_state = {
+                "cookies": [],
+                "origins": [
+                    {
+                        "origin": "https://creator.douyin.com",
+                        "localStorage": [
+                            {"name": "douyin_sparkflow_ua_spoof", "value": "chrome_128"},
+                            {"name": "is_secondary_user", "value": "false"},
+                        ],
+                        "sessionStorage": [
+                            {"name": "douyin_sparkflow_session", "value": "1"},
+                        ],
+                    },
+                    {
+                        "origin": "https://www.douyin.com",
+                        "localStorage": [
+                            {"name": "douyin_sparkflow_ua_spoof", "value": "chrome_128"},
+                        ],
+                    },
+                    {
+                        "origin": "https://passport.douyin.com",
+                        "localStorage": [
+                            {"name": "douyin_sparkflow_ua_spoof", "value": "chrome_128"},
+                        ],
+                    },
+                ],
+            }
+            for c in cookies:
+                # storage_state 需要 integer expires: 用 -1 表示 session
+                expires = c.get("expires")
+                if expires is None or (isinstance(expires, (int, float)) and expires <= 0):
+                    expires_int = -1
+                else:
+                    try:
+                        expires_int = int(float(expires))
+                    except Exception:
+                        expires_int = -1
+                sc = {
+                    "name": str(c.get("name", "")),
+                    "value": str(c.get("value", "")),
+                    "domain": str(c.get("domain", ".douyin.com")),
+                    "path": str(c.get("path", "/") or "/"),
+                    "expires": expires_int,
+                    "httpOnly": bool(c.get("httpOnly", False)),
+                    "secure": bool(c.get("secure", c.get("domain", "").endswith("douyin.com"))),
+                    "sameSite": "Lax",
+                }
+                storage_state["cookies"].append(sc)
+
+            # 把 cookies 转成请求头拦截用的 header 格式（key=value; key2=value2），按 domain 分桶
+            def _build_cookie_header_for(url):
+                host = ""
+                try:
+                    host = urllib.parse.urlparse(url).hostname or ""
+                except Exception:
+                    host = ""
+                lhost = host.lower()
+                parts = []
+                seen_names = set()
+                for c in cookies:
+                    dom = (c.get("domain") or "").lower()
+                    if not dom or not (lhost == dom or dom.startswith(".") and (lhost.endswith(dom) or "." + lhost == dom)):
+                        continue
+                    n = str(c.get("name", ""))
+                    if not n or n in seen_names:
+                        continue
+                    v = str(c.get("value", "") if c.get("value") is not None else "")
+                    seen_names.add(n)
+                    parts.append(f"{n}={v}")
+                return "; ".join(parts)
+
+            # extra_http_headers 用于给所有请求兜底塞 Cookie
+            extra_http_headers = {}
+            default_cookie_hdr = _build_cookie_header_for("https://creator.douyin.com")
+            if default_cookie_hdr:
+                extra_http_headers["Cookie"] = default_cookie_hdr
+
             context = browser.new_context(
                 user_agent=CHROME_UA,
                 locale="zh-CN",
@@ -238,9 +319,52 @@ def do_user_task(browser, username, cookies, targets):
                 is_mobile=False,
                 has_touch=False,
                 java_script_enabled=True,
+                storage_state=storage_state,
+                extra_http_headers=extra_http_headers if extra_http_headers else None,
             )
             context.set_default_navigation_timeout(config["browserTimeout"])
             context.set_default_timeout(config["browserTimeout"])
+
+            # === [深度修复] 注册 request 拦截：强制把 Cookie 塞进请求头 ===
+            # 即使 StorageState / add_cookies 因为 domain/path/httpOnly 匹配失败没生效，
+            # 这里也会兜底把 sessionid / passport 等关键字段塞进请求头，让服务器认为已登录。
+            # 只对 douyin 相关域名生效，避免影响 CDN/第三方。
+            first_request_logged = {"v": False}
+            def _on_request(route, request):
+                url = request.url
+                try:
+                    host = urllib.parse.urlparse(url).hostname or ""
+                except Exception:
+                    host = ""
+                # 只拦截 douyin / snssdk 核心域
+                is_douyin = any(
+                    host.endswith(d) or host == d.lstrip(".")
+                    for d in (
+                        ".douyin.com", "douyin.com", ".creator.douyin.com", "creator.douyin.com",
+                        ".passport.douyin.com", "passport.douyin.com", ".www.douyin.com", "www.douyin.com",
+                        ".snssdk.com", ".iesdouyin.com", ".bytedance.com", "www.tiktok-cn.com",
+                    )
+                )
+                if is_douyin:
+                    h = dict(request.headers or {})
+                    cookie_hdr = _build_cookie_header_for(url)
+                    if cookie_hdr:
+                        h["Cookie"] = cookie_hdr
+                    # 确保 Host 正确，避免被抖音反爬虫识别
+                    # 不修改 method/post_data，原样转发
+                    if not first_request_logged["v"]:
+                        first_request_logged["v"] = True
+                        logger.debug(
+                            f"账号 {username} 首次拦截核心域请求 {request.method} {url[:120]} "
+                            f"CookieHeader长度={len(cookie_hdr)}"
+                        )
+                    route.continue_(headers=h)
+                else:
+                    route.continue_()
+            try:
+                context.route("**/*", _on_request)
+            except Exception:
+                pass
 
             page = context.new_page()
 
@@ -264,17 +388,16 @@ def do_user_task(browser, username, cookies, targets):
             if matchMode == "short_id":  # 使用抖音号进行匹配
                 page.on("response", handle_response)
 
-            # ==== 登录流程（先 goto 建立域名上下文 → add_cookies → reload 真正带 Cookie 渲染）====
-            retry_operation(
-                "打开抖音创作者中心",
-                page.goto,
-                retries=config["taskRetryTimes"],
-                delay=5,
-                url="https://creator.douyin.com/",
-                wait_until="domcontentloaded",
-            )
-            context.add_cookies(cookies)
-            logger.debug(f"账号 {username} 已注入 {len(cookies)} 个 Cookie（含 domain 扩展清洗）")
+            # ==== [深度修复] 登录流程（顺序调整）：
+            # 1) 先 add_cookies 一次 + 补一次到 context（双重保险，storage_state 已注入，这里作为兜底）
+            # 2) 直接 goto creator.douyin.com 主域 / 消息页面，不要先访问空白页再跳转空白页
+            # ====
+            # 兜底：再调用 add_cookies 一次
+            try:
+                context.add_cookies(cookies)
+            except Exception as e:
+                logger.warning(f"账号 {username} context.add_cookies 失败（将通过 storage_state + 请求拦截兜底）: {e}")
+            logger.debug(f"账号 {username} 已注入 {len(cookies)} 个 Cookie（含 storage_state + add_cookies + 请求拦截三重保险）")
 
             retry_operation(
                 "导航到消息页面",
@@ -295,7 +418,7 @@ def do_user_task(browser, username, cookies, targets):
             except Exception:
                 pass
             # 再留一点时间给前端 React 渲染
-            time.sleep(3)
+            time.sleep(4)
 
             # 登录校验
             cur_url = page.url
@@ -307,20 +430,60 @@ def do_user_task(browser, username, cookies, targets):
                 raise RuntimeError(f"Cookie 无效，跳转到登录页: {cur_url}")
 
             try:
-                body_text = page.evaluate("() => document.body ? document.body.innerText.slice(0, 6000) : ''")
+                body_text = page.evaluate("() => document.body ? document.body.innerText.slice(0, 8000) : ''")
             except Exception:
                 body_text = ""
+            # [深度修复] 额外记录：document.cookie 里能看到什么非 httpOnly cookie
+            try:
+                doc_cookie = page.evaluate("() => (document.cookie || '').slice(0, 2000)")
+            except Exception:
+                doc_cookie = ""
+            logger.debug(f"账号 {username} document.cookie 可见部分（非 httpOnly）: {doc_cookie}")
+
             login_keywords = ["扫码登录", "请先登录", "立即登录", "未登录", "登录创作者平台", "手机号登录", "密码登录", "验证后可继续", "登录/注册"]
             hit_keywords = [kw for kw in login_keywords if kw in body_text]
 
             # 登录成功特征：body 里出现「数据中心」「互动管理」「聊天」「私信」「粉丝」任一
-            login_hints = ["数据中心", "互动管理", "作品管理", "私信管理", "消息中心", "朋友私信", "粉丝管理", "聊天", "主页"]
+            login_hints = ["数据中心", "互动管理", "作品管理", "私信管理", "消息中心", "朋友私信", "粉丝管理", "聊天", "主页", "会话", "发送消息", "全部朋友"]
             hint_hit = [h for h in login_hints if h in body_text]
+
+            # [深度修复] 如果命中登录关键字但 URL 正确且没跳转，可能是抖音登录弹窗/未登录组件，不是完全未登录。
+            # 先尝试关闭登录弹窗再检查一次（用常见弹窗选择器 + ESC 键）
+            if hit_keywords and not hint_hit:
+                logger.warning(f"账号 {username} 疑似仍显示登录相关文字（{hit_keywords}），尝试关闭登录弹窗后重新检查一次")
+                try:
+                    # 常见抖音未登录弹窗关闭按钮：X 图标 / 关闭 / 取消 / "我是创作者" / ESC
+                    close_xp = "xpath=//div[contains(@class,'close') or contains(@class,'icon-close') or contains(text(),'关闭') or contains(text(),'取消') or @aria-label='关闭']"
+                    if page.locator(close_xp).count() > 0:
+                        for i in range(min(3, page.locator(close_xp).count())):
+                            try:
+                                page.locator(close_xp).nth(i).click(timeout=1500)
+                            except Exception:
+                                pass
+                    # 点"我是创作者"按钮（如果存在）
+                    creator_btn = "xpath=//div[contains(@class,'tab') and (contains(text(),'我是创作者') or contains(text(),'创作者登录'))]"
+                    if page.locator(creator_btn).count() > 0:
+                        try: page.locator(creator_btn).first.click(timeout=1500)
+                        except Exception: pass
+                    page.keyboard.press("Escape")
+                    time.sleep(2)
+                    try:
+                        body_text2 = page.evaluate("() => document.body ? document.body.innerText.slice(0, 8000) : ''")
+                    except Exception:
+                        body_text2 = ""
+                    hint_hit2 = [h for h in login_hints if h in body_text2]
+                    hit_keywords2 = [kw for kw in login_keywords if kw in body_text2]
+                    if hint_hit2:
+                        hint_hit = hint_hit2
+                        hit_keywords = hit_keywords2
+                        body_text = body_text2
+                except Exception:
+                    pass
 
             if hit_keywords and not hint_hit:
                 logger.error(
                     f"账号 {username} 页面检测到登录关键字 {hit_keywords}，且没有登录成功特征 {hint_hit}。"
-                    f" body 前 400 字：{body_text[:400]}"
+                    f" body 前 600 字：{body_text[:600]}"
                 )
                 try: page.screenshot(path=f"logs/{username}_need_login.png", full_page=True)
                 except Exception: pass
