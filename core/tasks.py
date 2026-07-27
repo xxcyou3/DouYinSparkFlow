@@ -27,35 +27,74 @@ SEARCH_INPUT_SELECTOR = '[class*="search-input"]'
 
 
 def handle_response(response: Response):
-    """监听聊天页 user/info 接口响应，收集多种匹配键（备注/昵称/抖音号/unique_id/sec_uid）。"""
+    """监听聊天页多种 IM 接口响应，统一收集多种匹配键。"""
     global userIDDict
-    if "aweme/v1/web/im/user/info" in response.url:
+    try:
+        url = response.url
+        interested = (
+            "aweme/v1/web/im/user/info" in url
+            or "aweme/v1/creator/im/user_detail" in url
+            or "aweme/v1/web/im/user/list" in url
+            or "aweme/v1/web/im/conversation/list" in url
+            or "im/user" in url or "conversation" in url or "im_friends" in url or "im/friends" in url
+        )
+        if not interested:
+            return
         try:
             json_data = response.json()
-            for item in json_data.get("data", []):
-                short_id = item.get("short_id") or ""
-                unique_id = item.get("unique_id") or ""
-                sec_uid = item.get("sec_uid", "") or ""
-                nickname = norm(item.get("nickname"))
-                remark_name = norm(item.get("remark_name")) or nickname
+        except Exception:
+            return
+        candidates_lists = []
+        if isinstance(json_data, dict):
+            if isinstance(json_data.get("data"), list):
+                candidates_lists.append(json_data["data"])
+            if isinstance(json_data.get("user_list"), list):
+                candidates_lists.append(json_data["user_list"])
+            if isinstance(json_data.get("conversations"), list):
+                candidates_lists.append(json_data["conversations"])
+            if isinstance(json_data.get("conversation_list"), list):
+                candidates_lists.append(json_data["conversation_list"])
+            if isinstance(json_data.get("friends"), list):
+                candidates_lists.append(json_data["friends"])
+            # 嵌套 data.user_list / data.conversations 等
+            if isinstance(json_data.get("data"), dict):
+                inner = json_data["data"]
+                for kk in ("user_list", "data", "list", "conversations", "conversation_list", "friends", "items"):
+                    if isinstance(inner.get(kk), list):
+                        candidates_lists.append(inner[kk])
+        for items in candidates_lists:
+            for raw in items:
+                if not isinstance(raw, dict):
+                    continue
+                # 两种结构：外层带 user 字段 / 直接平铺字段
+                u = raw.get("user") if isinstance(raw.get("user"), dict) else raw
+                short_id = str(u.get("short_id") or u.get("shortId") or raw.get("short_id") or "")
+                unique_id = str(u.get("unique_id") or u.get("uniqueId") or raw.get("unique_id") or "")
+                sec_uid = str(u.get("sec_uid") or u.get("secUid") or raw.get("sec_uid") or "")
+                nickname = norm(u.get("nickname") or raw.get("nickname"))
+                remark_name = norm(u.get("remark_name") or u.get("remarkName") or raw.get("remark_name")) or nickname
+                user_id = str(u.get("user_id") or u.get("userId") or raw.get("user_id") or "")
+                if not (short_id or unique_id or sec_uid or nickname):
+                    continue
                 info = {
-                    "short_id": str(short_id),
-                    "unique_id": str(unique_id),
-                    "sec_uid": str(sec_uid),
+                    "short_id": short_id,
+                    "unique_id": unique_id,
+                    "sec_uid": sec_uid,
                     "nickname": nickname,
                     "remark_name": remark_name,
+                    "user_id": user_id,
                 }
                 keys = set()
-                for v in (remark_name, nickname, str(short_id), str(unique_id), sec_uid):
+                for v in (remark_name, nickname, short_id, unique_id, sec_uid, user_id):
                     vv = norm(v)
                     if vv:
                         keys.add(vv)
                 for k in keys:
                     userIDDict[k] = info
-        except Exception as e:
-            tb = traceback.extract_tb(e.__traceback__)
-            last = tb[-1]
-            logger.debug(f"解析 web/im/user/info 响应失败: {e} @ {last.filename}:{last.lineno}")
+    except Exception as e:
+        tb = traceback.extract_tb(e.__traceback__)
+        last = tb[-1] if tb else None
+        logger.debug(f"解析 IM 接口响应失败: {e} @ {getattr(last,'filename','?')}:{getattr(last,'lineno','?')}")
 
 
 def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
@@ -99,48 +138,138 @@ def checkTargetName(targetName, targets):
     return None
 
 
-def wait_chat_page_ready(page, username, max_wait=45):
-    """轮询等待聊天页骨架屏消失（真实会话内容渲染出来），主动触发 web/im/user/info 接口填充 userIDDict。"""
+def _close_login_save_popup(page, username):
+    """关闭「是否保存登录信息？」/「下次登录更便捷」等阻塞弹窗（返回是否关闭了弹窗）。"""
+    closed = False
+    try:
+        body = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        body = ""
+    popup_kw = ["是否保存登录信息", "下次登录更便捷", "个人中心关闭"]
+    if not any(k in body for k in popup_kw):
+        return False
+    logger.debug(f"账号 {username} 检测到保存登录信息弹窗，尝试关闭")
+    # 优先点「取消」，再点「保存」，再按 ESC
+    for text_match in ("取消", "保存", "关闭", "知道了", "好的", "下次再说", "稍后再说"):
+        try:
+            cand_xp = f"xpath=//*[self::button or self::div or self::span or self::a][normalize-space(string(.)) = {text_match!r}]"
+            n = page.locator(cand_xp).count()
+            if n == 0:
+                cand_xp = f'xpath=//*[self::button or self::div or self::span or self::a][contains(normalize-space(string(.)), {text_match!r})]'
+                n = page.locator(cand_xp).count()
+            if n > 0:
+                for i in range(min(n, 4)):
+                    try:
+                        loc = page.locator(cand_xp).nth(i)
+                        if loc.is_visible(timeout=600):
+                            loc.click(timeout=1200)
+                            closed = True
+                            time.sleep(0.8)
+                            break
+                    except Exception:
+                        continue
+                if closed:
+                    break
+        except Exception:
+            continue
+    try:
+        page.keyboard.press("Escape")
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    # 通用关闭 X 按钮
+    try:
+        close_xp = "xpath=//*[@aria-label='关闭' or contains(@class,'close') or contains(@class,'icon-close') or contains(@class,'Close') or contains(text(),'×')]"
+        if page.locator(close_xp).count() > 0:
+            for i in range(min(5, page.locator(close_xp).count())):
+                try:
+                    loc = page.locator(close_xp).nth(i)
+                    if loc.is_visible(timeout=500):
+                        loc.click(timeout=800)
+                        closed = True
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    time.sleep(1.2)
+    return closed
+
+
+def _probe_im_apis(page, username):
+    """主动调用聊天相关接口，填充 userIDDict，并返回接口返回快照用于日志。"""
     global userIDDict
-    def _is_skeleton_only():
+    snap = {}
+    try:
+        snap = page.evaluate("""async () => {
+            const res = {};
+            const urls = [
+                'https://www.douyin.com/aweme/v1/web/im/user/info/?cursor=0&user_source=0&count=100&version_code=1700&device_platform=webapp&aid=6383',
+                'https://www.douyin.com/aweme/v1/web/im/conversation/list/?cursor=0&count=50&version_code=1700&device_platform=webapp&aid=6383',
+                'https://www.douyin.com/aweme/v1/web/im/user/list/?cursor=0&count=100&version_code=1700&device_platform=webapp&aid=6383',
+                'https://creator.douyin.com/aweme/v1/creator/im/user_detail/?user_source=0&count=100&cursor=0&version_code=1700&device_platform=webapp&aid=6383',
+            ];
+            for (let i = 0; i < urls.length; i++) {
+                try {
+                    const r = await fetch(urls[i], {credentials:'include'});
+                    const t = await r.text();
+                    res['u'+i] = (t || '').slice(0, 500);
+                    res['s'+i] = r.status;
+                } catch(e) {
+                    res['e'+i] = String(e).slice(0,200);
+                }
+                await new Promise(r => setTimeout(r, 500));
+            }
+            return res;
+        }""")
+        logger.debug(
+            f"账号 {username} 主动探测 4 个 IM 接口结果："
+            + " ".join(f"{k}={snap[k]!r}" for k in sorted(snap.keys()) if str(snap[k])[:4] not in ("<htm",))
+        )
+    except Exception as e:
+        logger.debug(f"探测接口异常: {e}")
+    # 等待 2 秒，给 handle_response 时间处理
+    time.sleep(2.5)
+    return snap
+
+
+def wait_chat_page_ready(page, username, max_wait=60):
+    """轮询等待：关掉阻塞弹窗 + 骨架屏消失 + 有真实聊天内容。"""
+    global userIDDict
+    def _is_still_blocked():
         try:
             txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
         except Exception:
             txt = ""
+        # 有阻塞弹窗（保存登录信息/扫码登录）优先判定为阻塞
+        block_kw = ["是否保存登录信息", "下次登录更便捷", "个人中心关闭", "扫码登录", "请先登录", "立即登录", "手机号登录", "密码登录"]
+        if any(k in txt for k in block_kw):
+            return True
         lines = [l.strip() for l in txt.splitlines() if l.strip()]
-        # 骨架屏特征：页面只有 0-3 行非空文本，包含「抖音聊天」但没有任何真实会话文字（没有「发送/搜索/朋友/会话/消息」等词）
+        # 骨架屏 + 极少文本
         if len(lines) <= 4 and "抖音聊天" in txt:
-            extra_keywords = ["发送", "消息", "会话", "朋友", "粉丝", "好友", "聊天记录", "搜索"]
-            if not any(k in txt for k in extra_keywords):
+            extra = ["发送", "消息", "会话", "朋友", "粉丝", "好友", "聊天记录", "搜索", "今日", "昨天", "刚刚"]
+            if not any(k in txt for k in extra):
                 return True
         return False
 
     start = time.time()
     skel_rounds = 0
+    closed_popup_once = False
     while time.time() - start < max_wait:
-        if not _is_skeleton_only():
-            logger.debug(f"账号 {username} 聊天页骨架屏已消失，开始交互")
+        # 每轮先尝试关弹窗
+        if _close_login_save_popup(page, username):
+            closed_popup_once = True
+        if not _is_still_blocked():
+            # 再看一眼 userIDDict，如果还是 0，主动探测一次
+            if len(userIDDict) == 0 and skel_rounds >= 2:
+                _probe_im_apis(page, username)
+            logger.debug(f"账号 {username} 聊天页加载完毕（关过弹窗={closed_popup_once}），userIDDict={len(userIDDict)} 条")
             return True
         skel_rounds += 1
-        # 每 3 秒主动触发一次 user/info 接口，强制页面去拉数据（顺便填充 userIDDict）
+        # 每 2 轮探测一次接口（强制喂数据给 handle_response）
         if skel_rounds % 2 == 1:
-            try:
-                page.evaluate("""async () => {
-                    try {
-                        const base = 'https://www.douyin.com/aweme/v1/web/im/user/info/';
-                        for (let count = 20; count <= 120; count += 20) {
-                            try {
-                                const u = base + '?cursor=0&user_source=0&count=' + count + '&version_code=1700&device_platform=webapp&aid=6383';
-                                await fetch(u, {credentials:'include'}).then(r=>r.text()).catch(()=>{});
-                                await new Promise(r => setTimeout(r, 500));
-                            } catch(e) {}
-                        }
-                    } catch(e) {}
-                }""")
-                logger.debug(f"账号 {username} 已主动触发 user/info 接口，当前 userIDDict={len(userIDDict)} 条")
-            except Exception as e:
-                logger.debug(f"主动触发 user/info 失败: {e}")
-            # 尝试点击页面中心一下，触发懒加载
+            _probe_im_apis(page, username)
             try:
                 vw = page.evaluate("() => window.innerWidth || 1440")
                 vh = page.evaluate("() => window.innerHeight || 900")
@@ -150,10 +279,12 @@ def wait_chat_page_ready(page, username, max_wait=45):
         time.sleep(3)
     body_txt = ""
     try:
-        body_txt = page.evaluate("() => document.body ? document.body.innerText.slice(0, 600) : ''") or ""
+        body_txt = page.evaluate("() => document.body ? document.body.innerText.slice(0, 800) : ''") or ""
     except Exception:
         pass
-    logger.warning(f"账号 {username} 聊天页等待 {max_wait}s 仍疑似骨架屏。body前600字：{body_txt[:600]}")
+    logger.warning(f"账号 {username} 聊天页等待超时({max_wait}s)，关过弹窗={closed_popup_once}。body前800字：{body_txt[:800]}")
+    _close_login_save_popup(page, username)
+    _probe_im_apis(page, username)
     return False
 
 
@@ -222,10 +353,16 @@ def _try_search_and_enter(page, username, targets):
     search_candidates = [
         'input[placeholder*="搜索"]',
         'input[placeholder*="search" i]',
+        'input[type="search"]',
         'div[contenteditable="true"][data-placeholder*="搜索"]',
+        'div[contenteditable="true"][placeholder*="搜索"]',
         'textarea[placeholder*="搜索"]',
         '[class*="search"] input',
         '[class*="Search"] input',
+        '[class*="sidebar"] input',
+        '[class*="aside"] input',
+        '[class*="side"] input',
+        '[role="search"] input',
     ]
     search_loc = None
     for sc in search_candidates:
@@ -359,13 +496,36 @@ def scroll_and_select_user(page, username, targets):
                 pass
 
         if not target_elements_info:
-            logger.debug(f"第 {_round} 轮没有任何会话候选，滚动/等待")
+            empty_scroll_count += 1
+            logger.debug(f"第 {_round} 轮无会话候选，empty_scroll={empty_scroll_count}/{MAX_EMPTY_SCROLLS}（剩余={remaining_targets}）")
+            # 先兜底：如果已经达到空滚动阈值 OR userIDDict 有目标但就是没 DOM，直接走搜索框
+            if (empty_scroll_count >= MAX_EMPTY_SCROLLS and remaining_targets) or (
+                len(userIDDict) > 0 and empty_scroll_count >= 3 and remaining_targets
+            ):
+                logger.warning(f"会话列表策略无法继续（empty={empty_scroll_count}, userIDDict={len(userIDDict)}），进入搜索框兜底")
+                try:
+                    search_gen = _try_search_and_enter(page, username, remaining_targets)
+                    any_from_search = False
+                    for t in search_gen:
+                        any_from_search = True
+                        yield t
+                        try:
+                            remaining_targets.discard(t)
+                        except Exception:
+                            pass
+                        if len(remaining_targets) == 0:
+                            return
+                    if any_from_search or empty_scroll_count >= MAX_EMPTY_SCROLLS + 3:
+                        break
+                except Exception as e:
+                    logger.warning(f"搜索兜底异常: {e}")
+                    if empty_scroll_count >= MAX_EMPTY_SCROLLS + 3:
+                        break
             try:
                 page.evaluate("window.scrollBy(0, 500)")
             except Exception:
                 pass
             time.sleep(1.8)
-            empty_scroll_count += 1
             if empty_scroll_count >= MAX_EMPTY_SCROLLS + 5:
                 break
             continue
