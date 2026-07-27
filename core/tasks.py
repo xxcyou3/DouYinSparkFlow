@@ -1177,6 +1177,17 @@ def _search_and_open_profile_pm(page, username, target_short_ids):
 
 
 def do_user_task(browser, username, cookies, targets):
+    # ---- 解析 sessionid_short（后面报错日志要用） ----
+    _sid = ""
+    try:
+        for c in cookies:
+            if str(c.get("name")) == "sessionid" and c.get("value"):
+                _sid = str(c.get("value"))
+                break
+    except Exception:
+        _sid = ""
+    sessionid_short = (_sid[:16] + "...") if len(_sid) > 16 else _sid
+
     page = None
     context = None
     try:
