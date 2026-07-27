@@ -221,111 +221,137 @@ def do_user_task(browser, username, cookies, targets):
         page = None
         context = None
         try:
-            context = browser.new_context()  # 每个任务使用独立的上下文
-            context.set_default_navigation_timeout(config["browserTimeout"])  # 设置导航超时时间为 120 秒
-            context.set_default_timeout(config["browserTimeout"])  # 设置所有操作的默认超时时间为 120 秒
+            # [修复] 伪装浏览器指纹：真实 Chrome UA + zh-CN 语言 + Asia/Shanghai 时区
+            # 默认 Playwright UA 包含 "HeadlessChrome" 字样，抖音会拒绝登录态
+            CHROME_UA = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/128.0.0.0 Safari/537.36"
+            )
+            context = browser.new_context(
+                user_agent=CHROME_UA,
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                color_scheme="light",
+                viewport={"width": 1440, "height": 900},
+                device_scale_factor=1,
+                is_mobile=False,
+                has_touch=False,
+                java_script_enabled=True,
+            )
+            context.set_default_navigation_timeout(config["browserTimeout"])
+            context.set_default_timeout(config["browserTimeout"])
 
             page = context.new_page()
-            
+
+            # [修复] 注入 webdriver 检测绕过 + 常用反爬虫指纹伪装（navigator.webdriver=false, chrome.runtime, permissions, plugins 等）
+            try:
+                page.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN','zh','en-US','en'] });
+                    try { window.chrome = { runtime: {} }; } catch(e){}
+                    try { const originalQuery = window.navigator.permissions.query;
+                          window.navigator.permissions.query = (p) =>
+                            (p && (p.name === 'notifications' || p.name === 'persistent-storage'))
+                              ? Promise.resolve({ state: Notification.permission })
+                              : originalQuery(p);
+                    } catch(e){}
+                """)
+            except Exception:
+                pass
+
             if matchMode == "short_id":  # 使用抖音号进行匹配
                 page.on("response", handle_response)
-            
-            # ==== Cookie 注入流程（关键！）====
-            # 问题分析：page.goto(url) 后调用 context.add_cookies，
-            # Cookie 虽然已被设置，但刚刚渲染的 DOM 基于未登录状态生成，
-            # 必须 reload 一次才能让 Cookie 在这次请求中携带，从而渲染出已登录的聊天页。
-            # 原代码顺序：goto(creator.douyin.com) -> add_cookies -> goto(chat) 不刷新
-            # 修复流程:
-            #   1) 先 goto 创作者中心（建立域名上下文）
-            #   2) add_cookies
-            #   3) 导航到聊天页
-            #   4) reload() 强制带上新 Cookie 重新请求一次，确保服务端返回的是已登录内容
+
+            # ==== 登录流程（先 goto 建立域名上下文 → add_cookies → reload 真正带 Cookie 渲染）====
             retry_operation(
                 "打开抖音创作者中心",
                 page.goto,
                 retries=config["taskRetryTimes"],
                 delay=5,
                 url="https://creator.douyin.com/",
+                wait_until="domcontentloaded",
             )
-            # 注入 Cookie
             context.add_cookies(cookies)
-            logger.debug(f"账号 {username} 已注入 {len(cookies)} 个 Cookie")
+            logger.debug(f"账号 {username} 已注入 {len(cookies)} 个 Cookie（含 domain 扩展清洗）")
 
-            # 导航到消息页面
             retry_operation(
                 "导航到消息页面",
                 page.goto,
                 retries=config["taskRetryTimes"],
                 delay=5,
                 url="https://creator.douyin.com/creator-micro/data/following/chat",
+                wait_until="domcontentloaded",
             )
-            # ★ 关键修复：重新加载一次，确保 Cookie 实际生效
+            # 关键：重新加载一次确保 Cookie 实际生效到请求头
             logger.debug(f"账号 {username} Reload 页面以携带 Cookie")
-            page.reload(wait_until="domcontentloaded")
-            # 等待网络稳定
             try:
-                page.wait_for_load_state("networkidle", timeout=15000)
+                page.reload(wait_until="domcontentloaded")
+            except Exception as e:
+                logger.warning(f"Reload 超时，忽略继续: {e}")
+            try:
+                page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
                 pass
+            # 再留一点时间给前端 React 渲染
+            time.sleep(3)
 
-            # 登录校验：检测 URL / 页面中是否出现登录相关关键字
+            # 登录校验
             cur_url = page.url
             logger.debug(f"账号 {username} 当前页面 URL: {cur_url}")
             if any(k in cur_url.lower() for k in ["login", "passport", "signin", "sso"]):
                 logger.error(f"账号 {username} 页面跳转到了登录页 URL={cur_url}，Cookie 未生效或已过期，请重新获取 Cookie")
-                try:
-                    page.screenshot(path=f"logs/{username}_login_redirect.png", full_page=True)
-                except Exception:
-                    pass
+                try: page.screenshot(path=f"logs/{username}_login_redirect.png", full_page=True)
+                except Exception: pass
                 raise RuntimeError(f"Cookie 无效，跳转到登录页: {cur_url}")
 
-            # 二次校验：搜索页面内关键字（未登录态会有「登录」「扫码登录」等）
             try:
-                body_text = page.evaluate("() => document.body ? document.body.innerText.slice(0, 5000) : ''")
+                body_text = page.evaluate("() => document.body ? document.body.innerText.slice(0, 6000) : ''")
             except Exception:
                 body_text = ""
-            login_keywords = ["扫码登录", "请先登录", "立即登录", "未登录", "登录创作者平台", "手机号登录", "密码登录", "验证后可继续"]
+            login_keywords = ["扫码登录", "请先登录", "立即登录", "未登录", "登录创作者平台", "手机号登录", "密码登录", "验证后可继续", "登录/注册"]
             hit_keywords = [kw for kw in login_keywords if kw in body_text]
-            if hit_keywords:
+
+            # 登录成功特征：body 里出现「数据中心」「互动管理」「聊天」「私信」「粉丝」任一
+            login_hints = ["数据中心", "互动管理", "作品管理", "私信管理", "消息中心", "朋友私信", "粉丝管理", "聊天", "主页"]
+            hint_hit = [h for h in login_hints if h in body_text]
+
+            if hit_keywords and not hint_hit:
                 logger.error(
-                    f"账号 {username} 页面检测到登录相关关键字 {hit_keywords}，Cookie 未生效。"
-                    f" 当前 body 前 300 字：{body_text[:300]}"
+                    f"账号 {username} 页面检测到登录关键字 {hit_keywords}，且没有登录成功特征 {hint_hit}。"
+                    f" body 前 400 字：{body_text[:400]}"
                 )
-                try:
-                    page.screenshot(path=f"logs/{username}_need_login.png", full_page=True)
-                except Exception:
-                    pass
+                try: page.screenshot(path=f"logs/{username}_need_login.png", full_page=True)
+                except Exception: pass
                 raise RuntimeError(f"Cookie 未生效，页面仍处于登录态检测：{hit_keywords}")
 
-            logger.debug(f"账号 {username} 登录校验通过，开始发送消息流程")
+            logger.debug(
+                f"账号 {username} 登录校验通过（登录特征命中: {hint_hit}，URL={cur_url}），开始发送消息流程"
+            )
 
             logger.debug(f"账号 {username} 开始发送消息")
-            # 滚动并选择用户
             any_matched = False
             for friend_name in scroll_and_select_user(page, username, targets):
                 any_matched = True
                 logger.debug(f"账号 {username} 已选中好友 {friend_name} 发送消息")
-                # 等待聊天输入框元素加载完成，使用更稳定的属性选择器
                 chat_input_selector = "xpath=//div[contains(@class, 'chat-input-')]"
                 page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
                 chat_input = page.locator(chat_input_selector)
 
-                # 在 chat-input-dccKiL 中输入内容
                 message = build_message()
                 lines = message.split("\\n")
                 for i, line in enumerate(lines):
-                    chat_input.type(line)  # 输入每一行
-                    # 如果不是最后一行，模拟 Shift+Enter 插入换行
+                    chat_input.type(line)
                     if i != len(lines) - 1:
-                        chat_input.press("Shift+Enter")  # 模拟 Shift+Enter 插入换行
+                        chat_input.press("Shift+Enter")
 
                 logger.info(
                     f"账号 {username} 准备发送消息给好友 {friend_name}：\n\t{message}"
                 )
-                # 模拟按下回车键发送消息
                 chat_input.press("Enter")
                 logger.info(f"账号 {username} 给好友 {friend_name} 发送消息完成")
-                time.sleep(2)  # 发送完等待一会儿
+                time.sleep(2)
 
             if not any_matched:
                 logger.warning(
@@ -336,10 +362,8 @@ def do_user_task(browser, username, cookies, targets):
                     logger.warning(
                         f"账号 {username} 当前已收集 userIDDict 条目数: {len(userIDDict)}，内容: {json.dumps(userIDDict, ensure_ascii=False)[:800]}"
                     )
-                try:
-                    page.screenshot(path=f"logs/{username}_no_match.png", full_page=True)
-                except Exception:
-                    pass
+                try: page.screenshot(path=f"logs/{username}_no_match.png", full_page=True)
+                except Exception: pass
 
         except Exception as e:
             try:
@@ -347,12 +371,9 @@ def do_user_task(browser, username, cookies, targets):
                     page.screenshot(path=f"logs/{username}_ERROR.png", full_page=True)
                     logger.error(f"账号 {username} 已保存异常截图 logs/{username}_ERROR.png")
                     with open(f"logs/{username}_ERROR_page.html", "w", encoding="utf-8") as f:
-                        try:
-                            f.write(page.content())
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+                        try: f.write(page.content())
+                        except Exception: pass
+            except Exception: pass
             logger.error(
                 f"账号 {username} 执行任务时发生异常: {type(e).__name__}: {e}\n"
                 + traceback.format_exc()
@@ -361,9 +382,8 @@ def do_user_task(browser, username, cookies, targets):
         finally:
             try:
                 if context is not None:
-                    context.close()  # 任务完成后关闭上下文
-            except Exception:
-                pass
+                    context.close()
+            except Exception: pass
 
 
 def runTasks():
