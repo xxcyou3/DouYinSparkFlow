@@ -222,6 +222,97 @@ def _close_login_save_popup(page, username):
     return closed
 
 
+def _close_fullscreen_login_panel(page, username, timeout_each=1500):
+    """关闭抖音 www 首页的全屏登录遮罩 (login-full-panel)。
+
+    从第六版 run ea65233 的日志确认：<div id="login-full-panel-xxx"> subtree intercepts pointer events
+    导致任何 UI 点击（搜索框/消息按钮）都超时。
+    """
+    closed = False
+    # 1) 先找显式的关闭按钮
+    close_selectors = [
+        'div[id*="login-full-panel"] [class*="close"] [role="button"]',
+        'div[id*="login-full-panel"] [data-e2e*="close"]',
+        'div[id*="login-full-panel"] [class*="icon-close"]',
+        'div[id*="login-full-panel"] [class*="Close"]',
+        'div[id*="login-full-panel"] [aria-label="关闭"]',
+        'div[id*="login-panel"] [class*="close"] [role="button"]',
+        'svg[class*="login"] [class*="close"]',
+        "xpath=//div[contains(@id,'login-full-panel')]//*[name()='svg' or @role='button' or self::span or self::div][contains(normalize-space(.),'关闭') or contains(@class,'close') or contains(@aria-label,'关闭')]",
+    ]
+    for sx in close_selectors:
+        try:
+            n = page.locator(sx).count()
+            if n == 0:
+                continue
+            for i in range(min(2, n)):
+                try:
+                    loc = page.locator(sx).nth(i)
+                    try:
+                        vis = loc.is_visible(timeout=600)
+                    except Exception:
+                        vis = True
+                    if not vis:
+                        continue
+                    loc.click(timeout=timeout_each)
+                    closed = True
+                    time.sleep(0.8)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    # 2) 按 ESC
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(0.4)
+    except Exception:
+        pass
+    # 3) 暴力兜底：用 JS 把所有 login 全屏遮罩设为 display:none / pointer-events:none，然后移除 id=login-full-panel-xxx
+    try:
+        removed = page.evaluate("""() => {
+            let count = 0;
+            const kill = (el) => {
+                if (!el) return;
+                try { el.style.display='none'; } catch(_){}
+                try { el.style.pointerEvents='none'; } catch(_){}
+                try { el.style.visibility='hidden'; } catch(_){}
+                count++;
+            };
+            document.querySelectorAll('div[id*="login-full-panel"],div[id*="login-panel"],div[class*="login-full-panel"],div[class*="LoginFullPanel"],div[class*="loginMask"],div[class*="login-mask"]').forEach(kill);
+            document.querySelectorAll('[role="dialog"][aria-label*="登录"]').forEach(kill);
+            // 清 z-index 最高的遮罩层
+            const all = document.querySelectorAll('*');
+            for (let i=all.length-1; i>=Math.max(0,all.length-200); i--) {
+                const el = all[i];
+                try {
+                    const cs = getComputedStyle(el);
+                    const z = parseInt(cs.zIndex || '0',10);
+                    const pos = cs.position;
+                    const h = cs.height;
+                    const w = cs.width;
+                    const op = parseFloat(cs.opacity || '1');
+                    if ( (z>9000 || (pos==='fixed' && ((h==='100%' || h==='100vh' || parseInt(h||'0',10)>=window.innerHeight*0.9) && (w==='100%' || w==='100vw' || parseInt(w||'0',10)>=window.innerWidth*0.9)))) && op>=0.2) {
+                        const txt = (el.innerText || '').slice(0,120);
+                        if (txt.includes('登录') || txt.includes('扫码') || txt.includes('验证码') || /login-/i.test(el.id || '')) {
+                            kill(el);
+                        }
+                    }
+                } catch(_) {}
+            }
+            // 页面级 overflow 恢复
+            try { document.body.style.overflow = 'auto'; } catch(_){}
+            try { document.documentElement.style.overflow = 'auto'; } catch(_){}
+            return count;
+        }""")
+        if removed and removed > 0:
+            logger.debug(f"账号 {username} 暴力移除 {removed} 个全屏登录遮罩节点")
+            closed = True
+    except Exception as e:
+        logger.debug(f"暴力遮罩清除异常: {e}")
+    time.sleep(0.4)
+    return closed
+
+
 def _probe_im_apis(page, username):
     """所有接口强制走 https://www.douyin.com (IM/搜索/关注 API 仅在 www 域名可命中)."""
     global userIDDict
@@ -495,6 +586,9 @@ def _find_conversation_rows(page):
 
 def _try_search_and_enter(page, username, targets):
     """终极兜底：在聊天页找搜索框，输入目标抖音号/昵称，搜索后进入第一个结果。"""
+    # 先清全屏登录遮罩（可能在点消息弹层后再次弹出）
+    _close_fullscreen_login_panel(page, username)
+    _close_login_save_popup(page, username)
     search_candidates = [
         'input[placeholder*="搜索"]',
         'input[placeholder*="search" i]',
@@ -537,17 +631,59 @@ def _try_search_and_enter(page, username, targets):
     for t in list(targets):
         try:
             logger.info(f"账号 {username} 尝试用搜索框搜索目标 {t!r}")
-            search_loc.click(timeout=2000)
-            time.sleep(0.3)
+            # 失败重试：被 login-full-panel 拦截时，暴力清遮罩后再 dispatchEvent
+            for attempt in range(3):
+                try:
+                    _close_fullscreen_login_panel(page, username)
+                    if attempt == 0:
+                        search_loc.click(timeout=2000)
+                    else:
+                        # 暴力遮罩清不掉时，用 focus + dispatchEvent('click')
+                        try:
+                            page.evaluate("(el) => { if(!el) return; try { el.scrollIntoView({block:'center'}); } catch(_){} try { el.focus(); } catch(_){} try { const ev = new MouseEvent('click', {bubbles:true,cancelable:true}); el.dispatchEvent(ev); } catch(_){} }", search_loc.element_handle())
+                        except Exception:
+                            pass
+                    time.sleep(0.3)
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        raise e
+                    logger.debug(f"搜索框点击异常({attempt+1}/3)，清遮罩后重试: {e}")
+                    time.sleep(0.6)
             # 清空
             try:
-                search_loc.fill("")
-                for _ in range(3):
-                    search_loc.press("End")
-                    search_loc.press("Backspace")
+                for attempt in range(3):
+                    try:
+                        _close_fullscreen_login_panel(page, username)
+                        search_loc.fill("")
+                        for _ in range(3):
+                            search_loc.press("End")
+                            search_loc.press("Backspace")
+                        break
+                    except Exception as e:
+                        if attempt == 2:
+                            raise e
+                        logger.debug(f"搜索框清空异常({attempt+1}/3): {e}")
+                        time.sleep(0.5)
             except Exception:
                 pass
-            search_loc.type(str(t), timeout=4000)
+            # type 输入，失败时用 JS 设置 value + dispatchEvent('input')
+            try:
+                search_loc.type(str(t), timeout=4000)
+            except Exception as e:
+                logger.debug(f"搜索框 type 失败，改用 JS: {e}")
+                try:
+                    _close_fullscreen_login_panel(page, username)
+                    page.evaluate("""([el, val]) => {
+                        if(!el) return;
+                        try { el.scrollIntoView({block:'center'}); } catch(_){}
+                        try { el.focus(); } catch(_){}
+                        try { el.value = val; } catch(_){ try { el.textContent = val; } catch(_){} }
+                        try { el.dispatchEvent(new Event('input', {bubbles:true})); } catch(_){}
+                        try { el.dispatchEvent(new Event('change', {bubbles:true})); } catch(_){}
+                    }""", [search_loc.element_handle(), str(t)])
+                except Exception as ex:
+                    raise Exception(f"搜索框输入失败: {e}; JS也失败: {ex}") from e
             time.sleep(0.5)
             search_loc.press("Enter")
             time.sleep(2.5)
@@ -784,11 +920,13 @@ def _search_and_open_profile_pm(page, username, target_short_ids):
     目标列表是 target_short_ids（通常就是 ['1351217349'] 这种抖音号 / unique_id / 昵称）。
     每成功进入聊天窗就 yield 一个识别后的名字（用于日志/后续发送）。
     """
+    _close_fullscreen_login_panel(page, username)
     for t in target_short_ids:
         try:
             t = norm(t)
             if not t:
                 continue
+            _close_fullscreen_login_panel(page, username)
             logger.info(f"[终极兜底] 开始搜索抖音号/昵称 {t!r} → 个人页 → 私信")
             # 1) 先回到首页，确保有搜索框
             try:
@@ -798,6 +936,8 @@ def _search_and_open_profile_pm(page, username, target_short_ids):
                     try: page.wait_for_load_state("networkidle", timeout=12000)
                     except Exception: pass
                     time.sleep(2)
+                    _close_fullscreen_login_panel(page, username)
+                    _close_login_save_popup(page, username)
             except Exception:
                 pass
 
@@ -830,12 +970,56 @@ def _search_and_open_profile_pm(page, username, target_short_ids):
                     logger.warning(f"跳搜索结果页失败: {e}")
                     continue
             else:
+                search_input_failed = False
                 try:
-                    if hasattr(search_input, "click"): search_input.click(timeout=2000)
-                    search_input.fill("")
-                    search_input.type(t, delay=40)
-                    time.sleep(1.2)
-                    search_input.press("Enter")
+                    for attempt in range(3):
+                        try:
+                            _close_fullscreen_login_panel(page, username)
+                            if attempt == 0:
+                                search_input.click(timeout=2000)
+                            else:
+                                try:
+                                    page.evaluate("(el) => { if(!el) return; try { el.scrollIntoView({block:'center'}); } catch(_){} try { el.focus(); } catch(_){} try { el.dispatchEvent(new MouseEvent('click', {bubbles:true,cancelable:true})); } catch(_){} }", search_input.element_handle())
+                                except Exception:
+                                    pass
+                            time.sleep(0.4)
+                            break
+                        except Exception as e:
+                            if attempt == 2:
+                                raise e
+                            logger.debug(f"[终极兜底] 搜索框 click 异常({attempt+1}/3): {e}")
+                            time.sleep(0.6)
+                    # fill + type，失败时走 JS
+                    try:
+                        for attempt in range(3):
+                            try:
+                                _close_fullscreen_login_panel(page, username)
+                                search_input.fill("")
+                                search_input.type(t, delay=40)
+                                break
+                            except Exception as e:
+                                if attempt == 2:
+                                    raise e
+                                logger.debug(f"[终极兜底] 搜索框 fill 异常({attempt+1}/3): {e}")
+                                time.sleep(0.5)
+                    except Exception as e:
+                        logger.debug(f"[终极兜底] 搜索框 type 失败，改用 JS: {e}")
+                        try:
+                            _close_fullscreen_login_panel(page, username)
+                            page.evaluate("""([el, val]) => {
+                                if(!el) return;
+                                try { el.scrollIntoView({block:'center'}); } catch(_){}
+                                try { el.focus(); } catch(_){}
+                                try { el.value = val; } catch(_){ try { el.textContent = val; } catch(_){} }
+                                try { el.dispatchEvent(new Event('input', {bubbles:true})); } catch(_){}
+                                try { el.dispatchEvent(new Event('change', {bubbles:true})); } catch(_){}
+                            }""", [search_input.element_handle(), str(t)])
+                        except Exception as ex:
+                            logger.warning(f"[终极兜底] 搜索框输入 '...{t[-5:]}' 失败: {e}; JS也失败: {ex}")
+                            search_input_failed = True
+                    if not search_input_failed:
+                        time.sleep(1.2)
+                        search_input.press("Enter")
                 except Exception as e:
                     logger.warning(f"搜索框输入 {t!r} 失败: {e}")
                     search_url = f"https://www.douyin.com/search/{urllib.parse.quote(t)}?type=user"
@@ -1183,13 +1367,36 @@ def do_user_task(browser, username, cookies, targets):
             body_home = ""
         bad_kw = [k for k in ["扫码登录", "请先登录", "立即登录", "登录/注册", "手机号登录"] if k in body_home]
         good_kw = [k for k in ["推荐", "热榜", "关注", "搜索", "首页", "消息"] if k in body_home]
-        logger.debug(f"账号 {username} 首页登录特征：bad={bad_kw} good={good_kw}")
-        if bad_kw and not good_kw:
-            logger.warning(f"首页疑似未登录（{bad_kw}），继续尝试")
+        # 新的判断：有「登录」按钮（非"退出登录"语境）= 疑似未登录（无论是否有导航按钮）
+        has_login_btn = False
+        try:
+            has_login_btn = bool(page.evaluate("""() => {
+                const nodes = Array.from(document.querySelectorAll('a, button, div[role=button], span'));
+                for (const n of nodes) {
+                    const t = (n.innerText || '').trim();
+                    if (!t || t.length > 12) continue;
+                    if (t === '登录' || /^\\s*登录\\s*$/.test(t)) {
+                        try {
+                            const cs = getComputedStyle(n);
+                            if (cs.visibility === 'hidden' || cs.display === 'none') continue;
+                        } catch(_){}
+                        return true;
+                    }
+                }
+                return false;
+            }"""))
+        except Exception:
+            has_login_btn = "登录" in body_home and "退出登录" not in body_home
+        logger.debug(f"账号 {username} 首页登录特征：bad={bad_kw} good={good_kw} has_login_btn={has_login_btn}")
+
+        # 先关全屏登录遮罩（EA65233 明确有 login-full-panel 拦截所有点击）
+        _close_fullscreen_login_panel(page, username)
+        _close_login_save_popup(page, username)
 
         # 不再跳 creator 中心/message（2026年改版后 creator/message 只是通知中心，没有会话列表）
         # 留在 www.douyin.com（所有 IM API 都在这个域，且有首页搜索框）
         # 先尝试在首页点「消息」展开私信弹层（如果有）
+        _close_fullscreen_login_panel(page, username)
         try:
             msg_btns = [
                 "xpath=//a[contains(normalize-space(.),'消息') and not(contains(@href,'login'))]",
@@ -1301,8 +1508,52 @@ def do_user_task(browser, username, cookies, targets):
             pass
 
         # 先强制探测 2 轮，保证 userIDDict 在 www 域下有机会命中
+        probes_snaps = []
         for _ in range(2):
-            _probe_im_apis(page, username)
+            probes_snaps.append(_probe_im_apis(page, username))
+
+        # 严格登录态校验（EA65233 确认：导航按钮可能有 good_kw 但 followings 接口返回 status_code=8 → 实际未登录）
+        # 1. 解析探测接口里是否有 status_code == 8（用户未登录）
+        auth_fail_any = False
+        auth_fail_codes = []
+        for snap in probes_snaps:
+            if not isinstance(snap, dict):
+                continue
+            for u_idx in ["u0", "u1", "u2", "u3", "u4", "u5", "u6", "u7", "u8"]:
+                raw = snap.get(u_idx)
+                if not isinstance(raw, str) or not raw.startswith("{"):
+                    continue
+                try:
+                    j = json.loads(raw)
+                    sc = j.get("status_code")
+                    sm = str(j.get("status_msg") or "")
+                    if sc == 8 or "用户未登录" in sm:
+                        auth_fail_any = True
+                        auth_fail_codes.append(f"{u_idx}=sc{sc}({sm[:30]})")
+                        break
+                except Exception:
+                    continue
+            if auth_fail_any:
+                break
+        if has_login_btn and auth_fail_any:
+            logger.error(
+                f"账号 {username} 登录态校验失败：has_login_btn=True + 接口 status_code=8(用户未登录)={auth_fail_codes}。"
+                f" 说明 Cookie 未通过浏览器设备风控（Playwright 无头环境被识别为新设备 / 触发全屏登录遮罩 login-full-panel）。"
+                f" 请 1) 使用更新鲜的 Cookie（从浏览器正常登录后立刻复制）；2) 或改用本地手动扫码登录后把 cookie 覆盖到 GitHub Actions Secret。"
+                f" 当前 sessionid={sessionid_short!r}"
+            )
+            try:
+                body_now = page.evaluate("() => document.body ? document.body.innerText.slice(0, 1200) : ''") or ""
+                logger.debug(f"当前 body 前1200字: {body_now}")
+                page.screenshot(path=f"logs/{username}_auth_failed_sc8.png", full_page=True)
+                with open(f"logs/{username}_auth_failed_sc8.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Cookie 在无头环境下被风控（status_code=8 用户未登录），请重新抓取并在 Secret 替换最新 Cookie。"
+                f" 本次探测: {auth_fail_codes}"
+            )
 
         any_matched = False
         already_sent = set()
